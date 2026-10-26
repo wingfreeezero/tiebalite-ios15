@@ -14,8 +14,10 @@ private let autoSignDayFormatter: DateFormatter = TiebaDateFormats.fixed("yyyyMd
 /// 签到提醒本地通知。
 extension TiebaBackgroundSync {
   func performAutoSign() async throws {
+    await ensureSignContext()
     let snapshot = TiebaBackgroundSnapshot.shared
-    guard !snapshot.tbs.isEmpty, !snapshot.forumIds.isEmpty else { return }
+    guard !snapshot.bduss.isEmpty else { return }
+    guard !snapshot.forumIds.isEmpty else { return }
 
     let day = dayKey()
 
@@ -86,6 +88,69 @@ extension TiebaBackgroundSync {
   private func recordSignSuccess(_ rawForumId: Any?, in ids: inout Set<String>) {
     let forumId = string(rawForumId)
     if !forumId.isEmpty { ids.insert(forumId) }
+  }
+
+  // MARK: - 签到前置与前台补签
+
+  /// 自动签到的前置条件：tbs（签名令牌）与关注吧清单。
+  ///
+  /// 以前是 `guard !tbs.isEmpty, !forumIds.isEmpty else { return }` —— 两者任一为空就**静默返回**，
+  /// 表现就是「开了自动签到，什么也没发生」。实际上两者都能现取：
+  ///   * tbs 是 15 分钟级令牌，上次登录留下的经常已经空了/过期；
+  ///   * forumIds 只有在关注列表同步过之后才有，冷装用户直接开自动签到就是空的。
+  func ensureSignContext() async {
+    let snapshot = TiebaBackgroundSnapshot.shared
+    guard !snapshot.bduss.isEmpty else { return }
+    if snapshot.tbs.isEmpty {
+      _ = try? await TiebaSession.refreshTbs()
+    }
+    if snapshot.forumIds.isEmpty {
+      _ = try? await TiebaFollowedForums.fetchAll(force: false)
+    }
+  }
+
+  /// 前台补签：侧载包（TrollStore / SideStore 重签）基本拿不到 BGProcessingTask 的运行窗口
+  /// —— 系统只把它当「有空再说」，App 被强杀过就更可能一整天不跑。所以冷启动/回前台时
+  /// 自己再核一次：
+  ///
+  ///   偏好 `autoSign` 开着 + 今天已过 `autoSignTime` + 今天还没补过 → 直接跑一遍。
+  ///
+  /// 一天只补一次（`auto_sign_last_run_day` 记日键），环境不全（拿不到关注列表）就把标记撤掉，
+  /// 下次前台再来。结果与后台同一条通道（`performAutoSign`），完成会发同一条本地通知。
+  func runAutoSignCatchUpIfNeeded() async {
+    guard TiebaPreferenceSnapshot.bool("autoSign", default: false) else { return }
+    guard !TiebaBackgroundSnapshot.shared.bduss.isEmpty else { return }
+    let day = dayKey()
+    let markerKey = "tiebalite.native.auto_sign_last_run_day"
+    if (defaults.string(forKey: markerKey) ?? "") == day { return }
+    let time = TiebaPreferenceSnapshot.string("autoSignTime", default: "08:00")
+    let parts = time.split(separator: ":").compactMap { Int($0) }
+    guard parts.count == 2, let due = todayDate(hour: parts[0], minute: parts[1]), Date() >= due else {
+      return
+    }
+    // 先落标记再干活：避免回前台多次触发（以及 BGTask 恰好同时跑）时重复打服务器。
+    defaults.set(day, forKey: markerKey)
+    await ensureSignContext()
+    guard !TiebaBackgroundSnapshot.shared.forumIds.isEmpty else {
+      defaults.removeObject(forKey: markerKey)
+      return
+    }
+    do {
+      try await performAutoSign()
+      Self.log.info("autoSign foreground catch-up finished")
+    } catch {
+      Self.log.error(
+        "autoSign foreground catch-up failed: \(error.localizedDescription, privacy: .public)"
+      )
+    }
+  }
+
+  /// 今天的 hh:mm（不跨天）；取不到（日历异常）返回 nil。
+  private func todayDate(hour: Int, minute: Int) -> Date? {
+    var components = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+    components.hour = hour
+    components.minute = minute
+    return Calendar.current.date(from: components)
   }
 
   // Auto-sign coordination state (day-scoped, uid-namespaced)

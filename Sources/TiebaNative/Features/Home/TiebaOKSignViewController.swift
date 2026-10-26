@@ -385,17 +385,10 @@ final class TiebaOKSignViewController: UIViewController {
   private func handlePick(_ id: String, _ value: String) {
     switch id {
     case "autoSignTime":
-      let previous = TiebaPreferences.string("autoSignTime", default: "08:00")
       TiebaPreferences.set("autoSignTime", string: value)
       if TiebaPreferences.bool("autoSign", default: false) {
-        if !registerAutoSign(value) {
-          // 原生登记失败回滚为旧值，避免 UI 与定时任务不一致。
-          TiebaPreferences.set("autoSignTime", string: previous)
-          isScheduled = false
-          showError("更新签到时间失败")
-        } else {
-          isScheduled = true
-        }
+        // 时刻照存：BGTask 登记失败也不回滚（理由同 setAutoSign，前台补签会用这个时刻）。
+        isScheduled = registerAutoSign(value)
       }
       reload()
     default:
@@ -403,19 +396,24 @@ final class TiebaOKSignViewController: UIViewController {
     }
   }
 
-  /// 开/关自动签到：失败回滚偏好，避免 UI 与定时任务不一致。
+  /// 开/关自动签到。
+  ///
+  /// BGTask 在这里只算「加速器」：侧载/受限环境下 `BGTaskScheduler.submit` 常被系统拒
+  /// （后台额度、重签身份等），旧实现据此回滚偏好 —— 用户看到的就是「设置自动签到失败」，
+  /// 开关根本打不开。现在开关与 BGTask 解耦：登记失败也保持开启，由前台补签
+  /// （`TiebaBackgroundSync.runAutoSignCatchUpIfNeeded`：打开 App 时若已过设定时间且当天没签过，
+  /// 立刻签一遍）保证当天一定签。
   private func setAutoSign(_ enabled: Bool) {
     if enabled {
       let time = TiebaPreferences.string("autoSignTime", default: "08:00")
-      guard registerAutoSign(time) else {
-        TiebaPreferences.set("autoSign", bool: false)
-        isScheduled = false
-        showError("设置自动签到失败")
-        reload()
-        return
-      }
+      let scheduled = registerAutoSign(time)
       TiebaPreferences.set("autoSign", bool: true)
-      isScheduled = true
+      isScheduled = scheduled
+      if !scheduled {
+        TiebaAppHooks.showSignToast("已开启：系统不允许后台任务，改为每次打开 App 时补签", on: self)
+      }
+      // 立刻按新设置补一次（今天已过时刻且没签过就签），用户当场就能看到效果。
+      Task { await TiebaBackgroundSync.shared.runAutoSignCatchUpIfNeeded() }
     } else {
       TiebaPreferences.set("autoSign", bool: false)
       TiebaBackgroundSync.shared.cancelAutoSign()

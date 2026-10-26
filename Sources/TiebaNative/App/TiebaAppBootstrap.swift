@@ -125,6 +125,9 @@ public final class TiebaAppBootstrap {
       TiebaShareSheet.prewarm()
     }
     TiebaForegroundNotifier.shared.handleDidBecomeActive()
+    // 自动签到的前台兜底：侧载包拿不到可靠的 BGProcessingTask 窗口，回前台补一次当天漏的
+    // （方法内部按「偏好开着 + 已过设定时间 + 今天没补过」自己判，重复调用是 no-op）。
+    Task { await TiebaBackgroundSync.shared.runAutoSignCatchUpIfNeeded() }
   }
 
   /// 进后台：触觉引擎销毁省电。
@@ -254,6 +257,8 @@ public final class TiebaAppBootstrap {
     TiebaSession.purgeOrphanedSession()
     maybeAutoCleanCache()
     scheduleAutoSign()
+    // 冷启动也补一次（用户可能整晚没打开过 App，BGTask 又没轮到）。
+    await TiebaBackgroundSync.shared.runAutoSignCatchUpIfNeeded()
     await recoverLiveActivities()
     await setupNotifications()
     // 主 actor 只接收必须挂 UI/主 actor 单例的挂载点。
