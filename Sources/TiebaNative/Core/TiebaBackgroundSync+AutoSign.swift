@@ -123,7 +123,7 @@ extension TiebaBackgroundSync {
     let day = dayKey()
     let markerKey = "tiebalite.native.auto_sign_last_run_day"
     if (defaults.string(forKey: markerKey) ?? "") == day { return }
-    let time = TiebaPreferenceSnapshot.string("autoSignTime", default: "08:00")
+    let time = TiebaPreferences.string("autoSignTime", default: "08:00")
     let parts = time.split(separator: ":").compactMap { Int($0) }
     guard parts.count == 2, let due = todayDate(hour: parts[0], minute: parts[1]), Date() >= due else {
       return
