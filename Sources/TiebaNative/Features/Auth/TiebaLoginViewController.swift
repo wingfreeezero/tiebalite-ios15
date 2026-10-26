@@ -267,8 +267,19 @@ final class TiebaLoginViewController: UIViewController, TiebaNativeScreen {
   // MARK: - 登录检测
 
   private func isLoginRedirect(_ url: String) -> Bool {
-    url.hasPrefix("https://tieba.baidu.com/index/tbwise/")
-      || url.hasPrefix("https://tiebac.baidu.com/index/tbwise/")
+    // 登录页最终会跳回贴吧的「我的」页；百度的落地 URL 变过好几次（tbwise / index / h5），
+    // 这里放宽成「贴吧域名 + 落在 tbwise 路径」，避免 URL 一改就永远检测不到、只能等 60s 超时。
+    guard let components = URLComponents(string: url), let host = components.host else { return false }
+    let isTiebaHost = host == "tieba.baidu.com" || host == "tiebac.baidu.com"
+    guard isTiebaHost else { return false }
+    if components.path.contains("/index/tbwise") { return true }
+    // 有的账号走 h5 通行证，登录后直接回吧首页：贴吧域 + 已带回 BDUSS 也算完成。
+    if let tieba = URL(string: "https://tieba.baidu.com"),
+      let cookies = HTTPCookieStorage.shared.cookies(for: tieba)
+    {
+      return cookies.contains { $0.name.uppercased() == "BDUSS" && !$0.value.isEmpty }
+    }
+    return false
   }
 
   private func handleNavigation(_ rawURL: String) {
@@ -288,8 +299,12 @@ final class TiebaLoginViewController: UIViewController, TiebaNativeScreen {
     }
   }
 
-  /// 用 WKHTTPCookieStoreObserver（cookiesDidChange）驱动"BDUSS+STOKEN 齐备"
-  /// 判定：两者异步下发，每来一次变更就重读一遍；60s 超时是安全网。
+  /// 用 WKHTTPCookieStoreObserver（cookiesDidChange）驱动"BDUSS 到位"判定。
+  ///
+  /// 硬门槛只有 BDUSS：浏览/搜索/签到这些主路径都只需要它。STOKEN 只有部分签名接口用，
+  /// 且新版通行证在「扫码登录 / 已登录直接跳回 / 第三方授权」这些路径上经常不下发它 ——
+  /// 以前把 STOKEN 也当硬门槛，结果就是网页里明明登录成功，App 却报「凭据不完整」。
+  /// 现在的口径：等 BDUSS，等到后再给 STOKEN 8 秒，拿不到也继续（只是签名接口会少能力）。
   private func processLogin() async {
     let store = webView.configuration.websiteDataStore.httpCookieStore
     let observer = TiebaLoginCookieObserver { [weak self] in
@@ -306,20 +321,29 @@ final class TiebaLoginViewController: UIViewController, TiebaNativeScreen {
     }
 
     var cookies = await Self.nativeCookies()
-    while !Task.isCancelled, cookies["BDUSS"] == nil || cookies["STOKEN"] == nil {
+    while !Task.isCancelled, (cookies["BDUSS"] ?? "").isEmpty {
       // 检查与挂起同在主 actor 同步段：变更落在两者之间也会被下一次重读看到。
       await waitForCookieChange()
       cookies = await Self.nativeCookies()
     }
     guard !Task.isCancelled else { return }
+
+    if (cookies["STOKEN"] ?? "").isEmpty {
+      for _ in 0..<16 {
+        if Task.isCancelled { return }
+        if !(cookies["STOKEN"] ?? "").isEmpty { break }
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        cookies = await Self.nativeCookies()
+      }
+    }
+
     let bduss = cookies["BDUSS"] ?? ""
     let stoken = cookies["STOKEN"] ?? ""
     guard !bduss.isEmpty else {
-      fail("无法读取登录凭据（BDUSS）。\n\n请在开发构建中登录，或确认系统 Cookie 已写入。")
-      return
-    }
-    guard !stoken.isEmpty else {
-      fail("登录凭据不完整（已取得 BDUSS，STOKEN 未下发）。\n\n请重新登录一次；若仍复现，把 [login] 开头的日志发给开发者。")
+      // 把「收到了哪些 Cookie」一起写出来：这是远程排查这一条链路唯一有用的信息
+      //（不打印值，只打印名字）。
+      let names = cookies.keys.sorted().joined(separator: ", ")
+      fail("没拿到登录凭据（BDUSS）。\n\n当前 Cookie：\(names.isEmpty ? "（空）" : names)\n\n若一直停在这一步，请确认通行证页面已完成登录后再返回。")
       return
     }
     guard !Task.isCancelled else { return }

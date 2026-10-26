@@ -94,7 +94,15 @@ enum TiebaKeychain {
         return value
       }
     }
-    cache.withLock { _ = $0.misses.insert(key) }
+    cache.withLock { _ = $0.misses.insert(trimmed) }
+    // Keychain 整组不可用（侧载/重签后 errSecMissingEntitlement）时，凭据只可能在降级存储里。
+    if let fallbackValue = TiebaFallbackSecretStore.get(key: trimmed) {
+      cache.withLock { state in
+        state.hits[trimmed] = fallbackValue
+        state.misses.remove(trimmed)
+      }
+      return fallbackValue
+    }
     return nil
   }
 
@@ -118,15 +126,20 @@ enum TiebaKeychain {
       break
     case errSecDuplicateItem:
       let updateStatus = SecItemUpdate(query as CFDictionary, [kSecValueData as String: valueData] as CFDictionary)
-      guard updateStatus == errSecSuccess else {
-        throw TiebaKeychainError.writeFailed(updateStatus)
+      if updateStatus != errSecSuccess {
+        // 与 add 失败同处理：不冒泡，降级写文件（登录不能因为签名环境而失败）。
+        TiebaFallbackSecretStore.set(key: trimmed, value: value)
       }
     default:
-      throw TiebaKeychainError.writeFailed(status)
+      // 侧载（TrollStore / SideStore / AltStore 重签）后 keychain-access-group 可能整组不可用：
+      // SecItemAdd 返回 errSecMissingEntitlement(-34018) 之类，此时若照旧抛错，
+      // 用户看到的就是「登录失败」——但 WebView 里其实已经登录成功了。
+      // 这里降级到沙盒文件存储（权限 0600，与 keychain 同档 DataProtection），保证凭据不丢。
+      TiebaFallbackSecretStore.set(key: trimmed, value: value)
     }
     cache.withLock { state in
-      state.hits[key] = value
-      state.misses.remove(key)
+      state.hits[trimmed] = value
+      state.misses.remove(trimmed)
     }
   }
 
@@ -138,6 +151,7 @@ enum TiebaKeychain {
     for service in [baseService, authService, noAuthService] {
       SecItemDelete(baseQuery(service: service, key: key) as CFDictionary)
     }
+    TiebaFallbackSecretStore.delete(key: trimmed)
     cache.withLock { state in
       state.hits.removeValue(forKey: key)
       state.misses.insert(key)
@@ -176,6 +190,8 @@ enum TiebaKeychain {
         found.insert(account)
       }
     }
+    // 降级存储里的键一并算上（keychain 不可用时，账号列表只存在于那里）。
+    for key in TiebaFallbackSecretStore.keys(prefix: prefix) { found.insert(key) }
     return found.sorted()
   }
 
@@ -198,5 +214,89 @@ enum TiebaKeychain {
       kSecAttrGeneric as String: keyData,
       kSecAttrAccount as String: keyData,
     ]
+  }
+}
+
+// MARK: - 降级凭据存储（Keychain 不可用时）
+
+/// Keychain 的兜底：侧载/重签（TrollStore、SideStore、AltStore、Sideloadly）会把 App 的
+/// 签名换成 ad-hoc，`keychain-access-group` 随之失效，`SecItemAdd` 常返回
+/// `errSecMissingEntitlement (-34018)`。凭据写不进去的表现就是「网页里登录成功了，
+/// 回到 App 又变回未登录 / 登录失败」。
+///
+/// 这里落一份沙盒文件：`Application Support/TiebaSecrets.plist`
+///   * 权限 0600（仅本 App 用户可读写）；
+///   * DataProtection = `.completeFileProtectionUntilFirstUserAuthentication`
+///     （与 Keychain 的 `AfterFirstUnlock` 同档：锁屏后台任务仍可读）；
+///   * 二进制 plist，键就是原来 Keychain 的 account 名（`tiebalite.active.bduss` 等）。
+/// Keychain 一旦可用，读仍优先走 Keychain（见 `get`），这里只是并行备份。
+enum TiebaFallbackSecretStore {
+  /// nil = 还没从磁盘读过；读一次后缓存整个字典（凭据总条目数是个位数）。
+  private static let cache = TiebaMutex<[String: String]?>([:])
+
+  private static var fileURL: URL? {
+    guard
+      let base = try? FileManager.default.url(
+        for: .applicationSupportDirectory,
+        in: .userDomainMask,
+        appropriateFor: nil,
+        create: true
+      )
+    else { return nil }
+    return base.appendingPathComponent("TiebaSecrets.plist", isDirectory: false)
+  }
+
+  private static func loadLocked(_ state: inout [String: String]?) -> [String: String] {
+    if let state { return state }
+    var dict: [String: String] = [:]
+    if let url = fileURL, let data = try? Data(contentsOf: url),
+      let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil),
+      let decoded = plist as? [String: String]
+    {
+      dict = decoded
+    }
+    state = dict
+    return dict
+  }
+
+  private static func persist(_ dict: [String: String]) {
+    guard let url = fileURL else { return }
+    guard
+      let data = try? PropertyListSerialization.data(fromPropertyList: dict, format: .binary, options: 0)
+    else { return }
+    do {
+      try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+      try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    } catch {
+      // 落盘失败只能是沙盒/权限异常，调用方（登录）不该因此中断。
+      NSLog("[keychain] fallback persist failed: \(error.localizedDescription)")
+    }
+  }
+
+  static func get(key: String) -> String? {
+    cache.withLock { state in loadLocked(&state)[key] }
+  }
+
+  static func set(key: String, value: String) {
+    cache.withLock { state in
+      var dict = loadLocked(&state)
+      dict[key] = value
+      state = dict
+      persist(dict)
+    }
+  }
+
+  static func delete(key: String) {
+    cache.withLock { state in
+      var dict = loadLocked(&state)
+      guard dict.removeValue(forKey: key) != nil else { return }
+      state = dict
+      persist(dict)
+    }
+  }
+
+  static func keys(prefix: String) -> [String] {
+    let all: [String] = cache.withLock { state in Array(loadLocked(&state).keys) }
+    return all.filter { $0.hasPrefix(prefix) }
   }
 }

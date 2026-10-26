@@ -128,11 +128,41 @@ final class TiebaContentUnavailableView: UIView {
       self.contentStack.centerYAnchor.constraint(equalTo: self.centerYAnchor),
       self.contentStack.leadingAnchor.constraint(greaterThanOrEqualTo: self.leadingAnchor, constant: 24),
       self.contentStack.trailingAnchor.constraint(lessThanOrEqualTo: self.trailingAnchor, constant: -24),
+      // 左右 24 的硬边界之外再给一条确定宽度：标题/说明是多行 UILabel，没有被明确的可用宽度
+      // 就不会折行，窄屏（SE 375pt）上会撑出容器、看起来左右不对称。
+      self.contentStack.widthAnchor.constraint(lessThanOrEqualTo: self.widthAnchor, constant: -48),
     ])
+  }
+
+  /// 与系统版对齐：`UIContentUnavailableView` 给系统内在高度（实测 ~87pt，优先级 750），
+  /// 本仓若干页面的竖向约束按这个前提写（见 TiebaForumMembersViewController 的注释：
+  /// stateView 与列表四边同框时靠这条内在高度分高度）。移植版是自绘 UIView，必须自己给一份，
+  /// 否则「列表 + 空态」这类同框布局在窄屏上会被分偏。
+  override var intrinsicContentSize: CGSize {
+    let fitting = self.contentStack.systemLayoutSizeFitting(
+      CGSize(
+        width: UIView.layoutFittingCompressedSize.width,
+        height: UIView.layoutFittingCompressedSize.height
+      ),
+      withHorizontalFittingPriority: .fittingSizeLevel,
+      verticalFittingPriority: .fittingSizeLevel
+    )
+    return CGSize(width: UIView.noIntrinsicMetric, height: max(fitting.height + 32, 87))
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    let available = max(self.bounds.width - 48, 0)
+    if self.titleLabel.preferredMaxLayoutWidth != available {
+      self.titleLabel.preferredMaxLayoutWidth = available
+      self.messageLabel.preferredMaxLayoutWidth = available
+      self.invalidateIntrinsicContentSize()
+    }
   }
 
   private func applyConfiguration() {
     let configuration = self.configuration
+    self.invalidateIntrinsicContentSize()
 
     if configuration.showsSpinner {
       self.spinner.isHidden = false
