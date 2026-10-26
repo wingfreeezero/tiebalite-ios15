@@ -145,7 +145,12 @@ enum TiebaMessageAPI {
       total: counts.total
     )
     TiebaAppHooks.setTabBadge(index: TiebaTabIndex.notifications, text: counts.total > 99 ? "99+" : (counts.total > 0 ? String(counts.total) : ""))
-    Task { try? await UNUserNotificationCenter.current().setBadgeCount(counts.total) }
+    if #available(iOS 16.0, *) {
+      Task { try? await UNUserNotificationCenter.current().setBadgeCount(counts.total) }
+    } else {
+      // iOS 15：setBadgeCount 是 16 起，退回 applicationIconBadgeNumber（15 上可用，17 才废弃）。
+      Task { @MainActor in UIApplication.shared.applicationIconBadgeNumber = counts.total }
+    }
   }
 
   /// 行字典（TiebaSimpleRows 的 message 变体；字号/色板键与旧 MessageRow 一致）。

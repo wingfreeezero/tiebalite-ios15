@@ -79,7 +79,9 @@ final class TiebaContentUnavailableView: UIView {
   private let titleLabel = UILabel()
   private let messageLabel = UILabel()
   private let actionButton = UIButton(type: .system)
-  private var currentAction: UIAction?
+  /// 已登记的 UIAction 标识（iOS 14+ 的 `UIButton.addAction(_:for:)` 才拿得到 handler：
+  /// `UIAction.handler` 不是公开 API，所以这里挂到按钮上按标识增删）。
+  private var registeredActionIdentifier: UIAction.Identifier?
   private var iconSizeConstraints: [NSLayoutConstraint] = []
 
   var configuration: TiebaContentUnavailableConfiguration {
@@ -170,21 +172,23 @@ final class TiebaContentUnavailableView: UIView {
     self.messageLabel.textColor = configuration.secondaryTextProperties.color ?? .secondaryLabel
     self.messageLabel.numberOfLines = configuration.secondaryTextProperties.numberOfLines
 
-    self.currentAction = configuration.buttonProperties.primaryAction
-    self.actionButton.removeTarget(self, action: #selector(self.handleActionButton), for: .touchUpInside)
+    self.unregisterAction()
     if let buttonConfiguration = configuration.button {
       self.actionButton.configuration = buttonConfiguration
       self.actionButton.isHidden = false
-      if self.currentAction != nil {
-        self.actionButton.addTarget(self, action: #selector(self.handleActionButton), for: .touchUpInside)
+      if let primary = configuration.buttonProperties.primaryAction {
+        self.actionButton.addAction(primary, for: .touchUpInside)
+        self.registeredActionIdentifier = primary.identifier
       }
     } else {
       self.actionButton.isHidden = true
     }
   }
 
-  @objc private func handleActionButton() {
-    guard let action = self.currentAction else { return }
-    action.handler(action)
+  /// 换配置时先把上一枚 UIAction 摘掉，避免重复登记导致一次点击回调多次。
+  private func unregisterAction() {
+    guard let identifier = self.registeredActionIdentifier else { return }
+    self.actionButton.removeAction(identifiedBy: identifier, for: .touchUpInside)
+    self.registeredActionIdentifier = nil
   }
 }

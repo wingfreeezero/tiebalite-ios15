@@ -506,11 +506,14 @@ final class TiebaForumMembersViewController: UIViewController {
         heightDimension: .estimated(108)
       )
     )
-    let group = NSCollectionLayoutGroup.horizontal(
-      layoutSize: NSCollectionLayoutSize(widthDimension: .fractionalWidth(1), heightDimension: .estimated(108)),
-      repeatingSubitem: item,
-      count: columns
-    )
+    let layoutSize = NSCollectionLayoutSize(widthDimension: .fractionalWidth(1), heightDimension: .estimated(108))
+    let group: NSCollectionLayoutGroup
+    if #available(iOS 16.0, *) {
+      group = NSCollectionLayoutGroup.horizontal(layoutSize: layoutSize, repeatingSubitem: item, count: columns)
+    } else {
+      // iOS 15：repeatingSubitem 是 16 起；退回 subitem:count:（13 起，15 上可用，16 起标记废弃）。
+      group = NSCollectionLayoutGroup.horizontal(layoutSize: layoutSize, subitem: item, count: columns)
+    }
     group.interItemSpacing = .fixed(8)
     let section = NSCollectionLayoutSection(group: group)
     section.interGroupSpacing = 4

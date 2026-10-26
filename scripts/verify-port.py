@@ -85,6 +85,11 @@ API = [
     (r'(?<![\w])UICalendarView\b', '16.0', 'UICalendarView'),
     (r'\.sizingOptions\b', '16.0', 'UIHostingController.sizingOptions'),
     (r'(?<![\w])ImageRenderer\b', '16.0', 'SwiftUI ImageRenderer'),
+    (r'setBadgeCount', '16.0', 'UNUserNotificationCenter.setBadgeCount'),
+    (r'repeatingSubitem', '16.0', 'NSCollectionLayoutGroup.horizontal(repeatingSubitem:count:)'),
+    (r'layoutGroup\.horizontal\([^)]*subitems:', '16.0', 'NSCollectionLayoutGroup horizontal(subitems:)'),
+    (r'\.preferredTransition\b', '18.0', 'UIViewController.preferredTransition'),
+    (r'refreshingCloudStorage', '17.0', 'UIScrollView.refreshControl? (17)'),
     # 框架 / 并发 / 语言设施
     (r'(?<![\w])import ActivityKit', '16.1', 'ActivityKit'),
     (r'(?<![\w])import AppIntents', '16.0', 'AppIntents'),

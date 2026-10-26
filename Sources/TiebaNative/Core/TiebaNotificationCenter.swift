@@ -248,10 +248,15 @@ public final class TiebaNotificationCenter: NSObject, UNUserNotificationCenterDe
   /// 角标统一出口（applicationIconBadgeNumber 自 iOS 17 起废弃）。系统关掉
   /// "标记"时 setBadgeCount 抛错属预期，只记日志、不改变调用方流程。
   func setBadge(_ count: Int) async {
-    do {
-      try await UNUserNotificationCenter.current().setBadgeCount(count)
-    } catch {
-      Self.log.error("setBadgeCount failed: \(error.localizedDescription, privacy: .public)")
+    if #available(iOS 16.0, *) {
+      do {
+        try await UNUserNotificationCenter.current().setBadgeCount(count)
+      } catch {
+        Self.log.error("setBadgeCount failed: \(error.localizedDescription, privacy: .public)")
+      }
+    } else {
+      // iOS 15：setBadgeCount 是 16 起，退回 applicationIconBadgeNumber（15 上可用，17 才废弃）。
+      await MainActor.run { UIApplication.shared.applicationIconBadgeNumber = count }
     }
   }
 }
