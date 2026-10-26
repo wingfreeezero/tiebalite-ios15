@@ -51,7 +51,8 @@ command -v bazel >/dev/null || {
 say "1/6 部署底线自检（配置层必须是 15.0）"
 grep -q 'ios_minimum_os=15.0' .bazelrc                      || die ".bazelrc 的 --ios_minimum_os 不是 15.0"
 grep -q 'minimum_os_version = "15.0"' BUILD.bazel          || die "BUILD.bazel 的 minimum_os_version 不是 15.0"
-if grep -q 'extensions = \[' BUILD.bazel; then
+# 只看"真的写出来的属性"，别被注释里的「原值：extensions = [...]」骗到
+if grep -nE '^[[:space:]]*extensions[[:space:]]*=' BUILD.bazel; then
   die "BUILD.bazel 仍内嵌 appex —— iOS 15 上会装不上"
 fi
 /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' TiebaLite/Info.plist | grep -qx '15.0' \
