@@ -143,6 +143,14 @@ python3 scripts/verify-port.py --self-test # 扫描器自证
 
 当前结果：768 个 `.swift`、63 处系统件命中**全部**被 `#available` / `@available` 兜住，未兜住 **0**。
 
+已在 macOS runner 上真实编译通过（Actions run `40322555788`，Xcode 26.5 / Bazel 9.2.0）：
+
+```
+TiebaLite-2.2.0-iOS15.ipa   4.4 MB
+arm64 · LC_BUILD_VERSION minos 15.0.0 / sdk 26.5.0 · MinimumOSVersion 15.0
+56 条 LC_LOAD_DYLIB 无 ActivityKit · 无 PlugIns/ · 无内嵌 Frameworks/
+```
+
 ## 🙏 致谢
 
 本项目站在这些项目的肩膀上：

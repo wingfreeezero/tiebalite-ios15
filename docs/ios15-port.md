@@ -152,16 +152,24 @@ python3 scripts/verify-port.py --self-test
 | 语法 | tree-sitter 解析 768 个 `.swift`：报错 8 个，与上游基线**完全一致**（tree-sitter 自身的语法缺口，非真错）⇒ 改动没引入新的语法问题 |
 | 配置层 | `.bazelrc --ios_minimum_os` / `BUILD.bazel minimum_os_version` / `Info.plist LSMinimumSystemVersion` 三处都是 15.0；`extensions = [...]` 已摘除 |
 | protoc 可见性 | 267 个 `*.pb.swift` 全部含 `public` 声明（CI 的拆分前置条件满足） |
-| 未做 | **一次真实 `bazel build`**（本机无 Xcode/无 Apple 链接器）。第一次真编如果还剩几处 availability 报错，按报错点补 `#available` 即可 —— 扫描器已经把「能用静态手段发现的」压到 0 |
+| 真编译 | **已通过**：Actions run `40322555788`（macos-26 / Xcode 26.5 / Bazel 9.2.0），commit `c77a1e5`；产物 arm64 `minos 15.0.0 sdk 26.5.0`、无 ActivityKit、无 appex |
+| 真机运行 | 未做（手上没有 iOS 15 设备），启动验收请在你机器上完成 |
 
 ## 10. 已知风险（务必先读）
 
-* **未经过一次真实编译**：改动是按「上游二进制里实际引用的符号清单 + 全量可用性扫描」逐条替换的
-  （`UIContentUnavailable*`、`registerForTraitChanges`、`UIEditMenu*`、`UITextItem`、ActivityKit、
-  `UIFont.Width`、`Detent.custom`、`Task.sleep(for:)`、`effectiveGeometry`），但 Swift 的 availability
-  检查最终只有编译器说了算；第一次 `bazel build` 仍可能报几处，按提示包 `#available` 即可。
+* **已真实编译通过（2026-10-26）**：GitHub Actions `macos-26` + Xcode 26.5 上跑通了
+  `bazel build //:AppStripped --config=ci --config=release`（run `40322555788`，commit `c77a1e5`），
+  产物 `TiebaLite-2.2.0-iOS15.ipa`：arm64、`LC_BUILD_VERSION minos=15.0.0 / sdk=26.5.0`、
+  `MinimumOSVersion=15.0`、56 条 `LC_LOAD_DYLIB` 里没有 ActivityKit、无 `PlugIns/`、无内嵌 `Frameworks/`。
+  第一次真编暴露并修掉了 4 处只有编译器能发现的可用性问题（静态扫描覆盖不到的类型级用法）：
+  `UNUserNotificationCenter.setBadgeCount` ×2（iOS 16）、
+  `NSCollectionLayoutGroup.horizontal(layoutSize:repeatingSubitem:count:)`（iOS 16）、
+  以及兼容层里误用了非公开的 `UIAction.handler`（改成 `UIButton.addAction(_:for:)` + 按 `identifier` 摘除）。
+* **未经真机运行验证**：没有 iOS 15 设备在手，启动/崩溃只能由你在机器上验收。
 * **iOS 15.0 ~ 15.3 的并发运行时偏旧**：Swift 6 编译器生成的代码依赖系统自带的 `libswift_Concurrency`；
   15.0~15.3 那一版较旧，若启动即崩，优先在 **15.4+** 上验证。
 * 只保证 iPhone/iPad 的 **arm64 真机**构建（上游 CI 口径），模拟器未验证。
+* 产物的代码签名是「空签名」（`LC_CODE_SIGNATURE datasize=0`，`//:AppStripped` 剥符号时一并剥掉）：
+  TrollStore 导入时会自己 ldid 签名，SideStore / AltStore / Sideloadly 也是重签后再装，均不受影响。
 * 与上游 iOS 17 版的差别请对照第 6 节：Live Activity 整条链路空实现、任何系统版本都没有液态玻璃、
   少数 iOS 16/17 才有的交互（编辑菜单、自定义 detent、实时 trait 刷新、字宽）在该系统版本以下优雅降级。
