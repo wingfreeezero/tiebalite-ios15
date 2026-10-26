@@ -39,14 +39,14 @@ Signing/*.mobileprovision
 # 本地开发脚本与产物（含本机路径）
 /scripts/
 
-# iOS 15 移植：脚本与移植说明必须随仓库走，否则推到 GitHub 后 Actions 路线缺这两份材料
+# iOS 15 移植：脚本必须随仓库走（build-ipa.sh / verify-port.py）
 !/scripts/
 !/scripts/**
-!docs/ios15-port.md
 
 # 所有 Markdown 一律不入库（用户规则 2026-08-25），README 例外（GitHub 文档）
 *.md
 !README.md
+!docs/ios15-port.md
 
 # 第三方文档离线副本（本地查阅用，本就不入库；抓取工具已删除）
 docs/nuke/
