@@ -1,0 +1,253 @@
+name: Build iOS 15 Unsigned IPA
+
+# 一次编译出一个**最低 iOS 15.0** 的未签名真机 IPA：
+#   TiebaLite-<版本>-iOS15.ipa
+#
+# 口径（与上游工作流的差别只有这三条）：
+#   1. 部署底线 15.0（.bazelrc --ios_minimum_os / //:App minimum_os_version / Info.plist LSMinimumSystemVersion）；
+#   2. 不再内嵌 TiebaLiveActivity.appex（ActivityKit 是 16.1 起，内嵌会让 15 装不上/起不来）；
+#   3. 自检里加两道 iOS 15 硬门槛：二进制 minos 必须是 15.0、主二进制绝不能有 ActivityKit 的 LC_LOAD_DYLIB。
+#
+# 为什么 ad-hoc 等于"无签名"口径：rules_apple 对设备构建强制要求每个 bundle 都有 provisioning_profile
+# 工件（ios_rules.bzl 无条件挂 partial），但身份设成 ad-hoc（--ios_signing_cert_name=-）时它明确
+# 不拿该描述文件去签名（codesigning_support.bzl:528）。所以 Build 步现场生成一个结构合法的占位件，
+# 产物是 ad-hoc 签名、无团队标识 —— SideStore / AltStore / Sideloadly / TrollStore 重签时不影响安装。
+#
+# 产物只依赖 GitHub 的 macOS runner，不需要任何 Apple 账号或 secret。
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration'
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+      tag_name:
+        description: '发布到的 tag（如 v2.2.0-ios15；留空则只出 Artifact 不发 Release）'
+        type: string
+        required: false
+        default: ''
+      release_title:
+        description: 'Release 标题（留空则用 tag 名）'
+        type: string
+        required: false
+        default: ''
+      release_notes:
+        description: 'Release 说明（发布 Release 时填这里的文本）'
+        type: string
+        required: false
+        default: ''
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  DEPLOYMENT_TARGET: '15.0'
+
+jobs:
+  build:
+    name: Build (iOS 15)
+    # macOS 26 自带 Xcode 26.x：源码里 iOS 26 的液态玻璃分支需要 26 SDK 才能编过，
+    # 部署底线又要求 15.0 —— 两者只有这一个组合同时满足。
+    runs-on: macos-26
+    timeout-minutes: 120
+    concurrency:
+      group: ios15-build-${{ github.ref }}
+      cancel-in-progress: true
+    env:
+      CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          swift --version
+
+      # Bazel 磁盘/仓库缓存：命中后整包十几秒（冷编约 100 s）。
+      - name: Cache Bazel
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.bazel_cache/disk
+            ~/.bazel_cache/repository
+          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock', '.bazelrc', '.bazelversion', 'BUILD.bazel', '**/BUILD.bazel') }}
+          restore-keys: |
+            bazel-${{ runner.os }}-
+
+      # actions/cache 只负责存/取目录，Bazel 还得知道去哪读写：.bazelrc 用 try-import 引入
+      # .bazelrc.user（本地各自维护），runner 上不存在，所以这里现场写一份。
+      - name: Enable Bazel disk/repository cache
+        run: |
+          cat > .bazelrc.user <<EOF
+          build --disk_cache=$HOME/.bazel_cache/disk
+          build --repository_cache=$HOME/.bazel_cache/repository
+          EOF
+          cat .bazelrc.user
+
+      # //Sources/TiebaNative:Proto 依赖 267 个 protoc 产物是 public（默认生成 internal，
+      # 跨 module 不可见）。可见性错了会在生成物里报错、很难定位 —— 构建前先拦一次。
+      - name: Verify protoc-generated visibility
+        run: |
+          total=$(ls Sources/TiebaNative/Proto/Generated/*.pb.swift | wc -l | tr -d ' ')
+          missing=$(grep -L 'public ' Sources/TiebaNative/Proto/Generated/*.pb.swift | wc -l | tr -d ' ')
+          echo "protoc 产物: $total 个，其中不含任何 public 声明的: $missing 个"
+          if [ "$missing" != "0" ]; then
+            echo "::error::有 $missing 个 protoc 产物不含 public 声明，请用 protoc-gen-swift --swift_opt=Visibility=Public 重新生成。"
+            exit 1
+          fi
+
+      # 部署底线自检（配置层）：写错一处就会静默出一个 iOS 17 包，装上即崩 —— 先静态核一遍。
+      - name: Verify deployment target (config level)
+        run: |
+          set -e
+          grep -q 'ios_minimum_os=15.0' .bazelrc || { echo '::error::.bazelrc 的 --ios_minimum_os 不是 15.0'; exit 1; }
+          grep -q 'minimum_os_version = "15.0"' BUILD.bazel || { echo '::error::BUILD.bazel 的 minimum_os_version 不是 15.0'; exit 1; }
+          grep -q 'extensions = \[' BUILD.bazel && { echo '::error::BUILD.bazel 仍内嵌 appex（15 上会装不上）'; exit 1; } || true
+          /usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" TiebaLite/Info.plist | grep -qx '15.0'
+          echo "配置层部署底线检查通过：15.0"
+
+      - name: Build (bazel, ad-hoc signed iOS 15 device IPA)
+        run: |
+          brew install bazelisk
+          bazel --version
+          # ── 占位描述文件 ──
+          # rules_apple 对设备构建强制要求每个 bundle 都有 provisioning_profile 工件，且会解析它取
+          # entitlements；身份是 ad-hoc 时不做签名，所以只要一个结构合法、键齐全的容器。
+          mkdir -p Signing
+          keep=0
+          for out in Signing/app.mobileprovision Signing/ext.mobileprovision; do
+            if [ -f "$out" ] && [ "$(wc -c < "$out" | tr -d ' ')" -gt 4096 ]; then keep=1; fi
+          done
+          if [ "$keep" = "1" ]; then
+            echo "keep existing provisioning profiles"
+          else
+            tmp="$(mktemp -d)"
+            trap 'rm -rf "$tmp"' EXIT
+            cat > "$tmp/profile.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>AppIDName</key><string>BuildPlaceholder</string>
+          <key>ApplicationIdentifierPrefix</key><array><string>0000000000</string></array>
+          <key>CreationDate</key><date>2026-01-01T00:00:00Z</date>
+          <key>Platform</key><array><string>iOS</string></array>
+          <key>Entitlements</key><dict/>
+          <key>ExpirationDate</key><date>2040-01-01T00:00:00Z</date>
+          <key>Name</key><string>BuildPlaceholder</string>
+          <key>TeamIdentifier</key><array><string>0000000000</string></array>
+          <key>TeamName</key><string>BuildPlaceholder</string>
+          <key>TimeToLive</key><integer>3650</integer>
+          <key>UUID</key><string>00000000-0000-0000-0000-000000000000</string>
+          <key>Version</key><integer>1</integer>
+          </dict></plist>
+          PLIST
+            openssl req -x509 -newkey rsa:2048 -nodes -keyout "$tmp/key.pem" -out "$tmp/cert.pem" \
+              -days 3650 -subj "/CN=BuildPlaceholder" 2>/dev/null
+            for out in Signing/app.mobileprovision Signing/ext.mobileprovision; do
+              openssl smime -sign -in "$tmp/profile.plist" -signer "$tmp/cert.pem" -inkey "$tmp/key.pem" \
+                -nodetach -outform der -out "$out" 2>/dev/null
+              echo "wrote $out ($(wc -c < "$out" | tr -d ' ') bytes)"
+            done
+          fi
+          mode=$([ "$CONFIGURATION" = "Release" ] && echo release || echo debug)
+          # //:AppStripped = //:App 的 IPA 再剥一遍符号表（体积约 -12%）；dSYM 由 //:App 生成，
+          # 剥离不改 UUID，崩溃符号化不受影响。
+          bazel build //:AppStripped --config=ci --config="$mode"
+
+      - name: Package IPA
+        run: |
+          set -e
+          version=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" TiebaLite/Info.plist)
+          tag="${{ inputs.tag_name || github.ref_name }}"
+          case "$tag" in
+            v*) base="TiebaLite-$tag" ;;
+            *)  base="TiebaLite-${version}-iOS15-$(echo "${GITHUB_SHA}" | cut -c1-7)" ;;
+          esac
+          echo "IPA_NAME=${base}.ipa" >> "$GITHUB_ENV"
+          rm -rf build && mkdir -p build
+          unzip -q bazel-bin/AppStripped.ipa -d build
+          ( cd build && zip -qry "$(basename "${base}.ipa")" Payload )
+          unzip -l "build/${base}.ipa" | head -20
+
+      # ── 产物层自检（三道 iOS 15 硬门槛）────────────────────────────────────
+      - name: Verify IPA is really iOS 15
+        run: |
+          set -e
+          app=$(ls -d build/Payload/*.app)
+          bin="$app/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
+
+          echo "— 1/4 Info.plist MinimumOSVersion / LSMinimumSystemVersion"
+          min=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist")
+          lsmin=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$app/Info.plist" || echo "$min")
+          echo "MinimumOSVersion=$min  LSMinimumSystemVersion=$lsmin"
+          [ "$min" = "$DEPLOYMENT_TARGET" ] || { echo "::error::MinimumOSVersion=$min，期望 $DEPLOYMENT_TARGET"; exit 1; }
+
+          echo "— 2/4 Mach-O LC_BUILD_VERSION minos"
+          xcrun vtool -show-build "$bin" | sed -n '1,12p'
+          xcrun vtool -show-build "$bin" | grep -q "minos $DEPLOYMENT_TARGET" \
+            || { echo "::error::主二进制 minos 不是 $DEPLOYMENT_TARGET（iOS 15 装不上/起不来）"; exit 1; }
+
+          echo "— 3/4 依赖的框架里不能有 ActivityKit（15 上 dyld 会直接拒绝启动）"
+          if otool -L "$bin" | grep -q 'ActivityKit'; then
+            echo "::error::主二进制仍链接 ActivityKit.framework；把 LiveActivity 空实现换回前不能降到 15.0"
+            exit 1
+          fi
+          otool -L "$bin" | awk 'NR>1 {print $1}' | sed 's|/System/Library/Frameworks/||' | sort -u | head -40
+
+          echo "— 4/4 不应内嵌任何 appex（Live Activity 扩展在 15 上装不上）"
+          if [ -d "$app/PlugIns" ]; then
+            echo "::error::产物里仍有 PlugIns/（appex）"; ls "$app/PlugIns"; exit 1
+          fi
+          echo "全部通过：这是一个最低 iOS 15.0 的未签名 IPA。"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-ios15
+          path: build/${{ env.IPA_NAME }}
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "### TiebaLite iOS 15 构建完成"
+            echo ""
+            echo "- 产物：\`${{ env.IPA_NAME }}\`（未签名，供 SideStore / AltStore / Sideloadly / TrollStore 重签）"
+            echo "- 部署底线：iOS $DEPLOYMENT_TARGET"
+            echo "- 配置：$CONFIGURATION"
+            echo ""
+            echo "安装：TrollStore 直接导入；或用 SideStore / AltStore / Sideloadly 用自己的 Apple ID 重签。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # 构建产物出来后发 Release（只在"手动触发且填了 tag_name"或"push 了 v* tag"时执行）。
+  release:
+    needs: build
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.tag_name != '') ||
+      startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download IPAs
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name }}
+          name: ${{ (github.event_name == 'workflow_dispatch' && inputs.release_title != '') && inputs.release_title || (github.event_name == 'workflow_dispatch' && inputs.tag_name || github.ref_name) }}
+          body: ${{ github.event_name == 'workflow_dispatch' && inputs.release_notes || '' }}
+          generate_release_notes: ${{ github.event_name != 'workflow_dispatch' }}
+          files: dist/*.ipa
+          fail_on_unmatched_files: true

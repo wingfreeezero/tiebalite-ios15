@@ -1,0 +1,67 @@
+# 依赖（JS 时代遗留，仓库已无 JS；留一条兜底避免误入）
+node_modules/
+
+# 本地工具/脚本目录（**永不入库**：用户口径 2026-10-07）
+# 构建与打包需要的那几段逻辑已内联进 BUILD.bazel 与 .github/workflows/build-ipa.yml，
+# 这里放本机自己的脚本不会再被同步上去。
+/Tools/
+
+# 构建产物
+dist/
+/build/
+*.ipa
+/xcodeproj.xcodeproj/
+/bazel-*
+
+# 签名材料与本地密钥（**永不入库**：描述文件含 Apple ID/团队/设备 UDID）
+Signing/*.mobileprovision
+*.mobileprovision
+.env*.local
+*.jks
+*.p8
+*.p12
+*.key
+*.pem
+
+# 本机 Bazel 缓存路径（含用户名）
+/.bazelrc.user
+
+# 工具状态与 IDE
+.mimosa/
+.zcode/
+.vscode/
+.idea/
+.claude/
+.Qoder/
+.DS_Store
+*.local
+
+# 本地开发脚本与产物（含本机路径）
+/scripts/
+
+# iOS 15 移植：脚本与移植说明必须随仓库走，否则推到 GitHub 后 Actions 路线缺这两份材料
+!/scripts/
+!/scripts/**
+!docs/ios15-port.md
+
+# 所有 Markdown 一律不入库（用户规则 2026-08-25），README 例外（GitHub 文档）
+*.md
+!README.md
+
+# 第三方文档离线副本（本地查阅用，本就不入库；抓取工具已删除）
+docs/nuke/
+docs/iglistkit/
+docs/alamofire/
+docs/jxsegmentedview/
+docs/swiftyjson/
+docs/texture/
+
+# Swift 编译产物（typecheck 会落在仓库根）
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+*.abi.json
+
+# 第三方付费报告原文（tgtricks 11 章抽取文本，仅作本地对照依据）：体积大且非本仓版权，
+# 不入库。由它派生出的分析（coverage-matrix / audit-221 / sweep-report / gaps-*）正常跟踪。
+docs/tgtricks/ios-uikit/

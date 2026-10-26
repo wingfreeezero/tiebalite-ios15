@@ -1,0 +1,280 @@
+// TiebaLite — 行页发布驱动（TiebaRowPageDriver）
+//
+// 通用列表页共用的「造行 → 后台整页测量 → 回主线程换页」流程：publish 在主线程
+// 取行，Task.detached 跑 TiebaKindRowPages.prepareBlocking，回主后只在 pageKey
+// 仍是本次发布的页时才 setPage——旧页测量后到不得覆盖新页（唯一竞态修复点）。
+//
+// 行的身份 = **内容指纹**（TiebaRowDiff）：判"纯追加"从"逐行 NSDictionary 递归深比较"
+// 换成整数比较（旧行指纹随 lastRows 缓存，不重算）；变了的时候用 vendored
+// 上游 Support 模块 的 tiebaMergeListsStableWithUpdates(isLess:isEqual:getId:) 算出
+// 并随页把**内容身份**（TiebaRowDiff.Entry.identity）交给列表（setPage(pageKey:identities:)）：
+// 列表的 TiebaKindItem 以内容身份为标识，diffable 据此自己算增量，
+// 因此同页重推不再需要"可见行全量重配"。
+
+import Foundation
+
+// MARK: - 行载荷
+
+/// 行载荷：能被驱动接受的行，必须能降级成行字典（TiebaKindRowPages.prepareBlocking 的输入）。
+/// 字典行直接返回 self；强类型行（如 TiebaThreadPost）在自己的扩展里给出等价字典。
+///
+/// ⚠️ 只适用于 **feed / simple 两族**：这两族的度量入口吃行字典（整页 prepareBlocking）。
+/// post 族（帖子页/楼中楼）的行模型由 TiebaPostRowMetrics 按模型对象键控、且模型带页级
+/// 上下文（工具栏/偏好/色板/主贴标题/Hero 配对），字典还原不出等价模型 —— 见文件末说明。
+public protocol TiebaRowPagePayload {
+  var tiebaRowDictionary: [String: Any] { get }
+}
+
+extension Dictionary: TiebaRowPagePayload where Key == String, Value == Any {
+  public var tiebaRowDictionary: [String: Any] { self }
+}
+
+@MainActor
+public final class TiebaRowPageDriver {
+  private let list: TiebaKindListContentView
+  private let keyPrefix: String
+  private var pageSeq = 0
+  private var lastWidth: CGFloat = 0
+  /// 上次的造行闭包：宽度变化（旋转/分屏）时用它以同页键重推。
+  /// 调用方必须传 `[weak self]` 闭包，否则 page → driver → 闭包 → page 成环。
+  private var lastMakeRows: (() -> [[String: Any]])?
+  /// 上次发布带的"落地钩子"（搜索页的 reveal 用它）。与 lastMakeRows 同生命周期：
+  /// 宽度未就位而被推迟的那次发布，补发落地时也要补跑它 —— 否则首屏会停在隐藏状态。
+  private var lastOnLanded: (@MainActor () -> Void)?
+  /// 上一次「宿主自建模型」发布的两个闭包：宽度变化 / 缺页自愈时用它以同页键重推。
+  /// 与 lastMakeRows 互斥 —— 同一屏只走一条发布路径，谁发布谁就把另一条清空。
+  private var lastPrepared: (
+    prepare: @Sendable (String, CGFloat) -> Void,
+    land: @MainActor (String) -> Void
+  )?
+
+  /// 发布序号（单调递增）。**回主守卫必须同时比它**：纯追加（loadMore）与 fresh:false
+  /// （乐观点赞）都不换页键，只比 pageKey 时两次在途测量的完成闭包会互相覆盖 ——
+  /// 晚到的旧快照把新状态拨回去（N9：刚加载出的行消失 / 红心被翻回去）。
+  private var publishSeq = 0
+  /// 已落地的最大序号：只有更新的发布才允许覆盖状态。
+  private var landedSeq = 0
+
+  /// 上次发布的整页行——每行带**内容指纹**（TiebaRowDiff.Entry）：判"追加"与算差量都读它，
+  /// 旧行指纹因此只算一次、不重算。每屏一份、只留最近一页。
+  /// 并发纪律与原来一致（唯一写点没变）：只在主线程写，且只在 publish 的回主闭包里、
+  /// `self.pageKey == key` 成立时才落盘——旧页测量后到不得覆盖新页。
+  /// 行与指纹同存同换（同一个数组，天然不会不同步）。
+  private var lastRows: [TiebaRowDiff.Entry] = []
+
+  // [收敛] 原 `lastRowDiff: TiebaRowDiff.Change?` 已删除（2026-10-05）：每次 publish 在主线程白算整页差量却无消费方；
+  // 增量更新现由「行内容身份 + diffable」承担（TiebaKindItem.identity）。`TiebaRowDiff.make` / `tailAppend` 作库 API 保留（有 selfCheck 覆盖，插入/删除动画需要 previousIndex 时可直接调用）。
+
+  /// 当前页键（fresh 发布时 = "\(keyPrefix)-\(pageSeq)"；未发布 = ""）。
+  public private(set) var pageKey = ""
+
+  /// 上次发布用的量化宽度。宿主拿它记"上一份模型是按多宽测的"（宽度变化即全量重造）。
+  public var publishedWidth: CGFloat { lastWidth }
+
+  /// 进程内实例域：页键命名空间原先只由宿主的 keyPrefix 决定，而多个宿主用的是
+  /// **常量前缀**（forum-search / history / …）—— 两个存活实例（吧 A 搜索 → 点帖 →
+  /// 帖内跳吧 B → 吧 B 搜索）pageSeq 追平即同键：后发布者覆写共享页记录与度量页索引，
+  /// 两屏还会互相 pin/unpin（一屏 pop 摘掉另一屏在显页的 pin → 整页 LRU 挤掉在显页 =
+  /// "点进帖子退回来只剩那张卡、上下全白"的静默留白重演）。
+  /// 在 driver 里追加实例域：**一处修复覆盖全部调用方**，宿主给的 keyPrefix 语义不变。
+  /// 用自增序号而不是对象地址：地址会被复用，进程级页记录里可能留着上一实例的同键条目。
+  private static let instanceDomain = TiebaMutex<Int>(0)
+
+  public init(list: TiebaKindListContentView, keyPrefix: String) {
+    self.list = list
+    self.keyPrefix = keyPrefix + "-" + String(Self.instanceDomain.withLock { domain in
+      domain += 1
+      return domain
+    })
+    // 缺页自愈：列表发现**行内容确实没有测**（全局度量失效 / 换了宽度还没测完 /
+    // 页面发布晚到）时回调这里重推（列表侧已按 0.5s 自适应节流）。
+    // [精简] 触发面已收窄：页记录不再靠共享存储（列表自持 currentPage），行内容是
+    // 内容键 + 跨页复用，所以"被别的屏挤掉就静默留白"那条链不再成立；留下的都是
+    // 内容真不在的情况 —— 那类只有重推能救，且重推现在是内容全命中的廉价操作。
+    list.onPageDataMissing = { [weak self] in
+      self?.republishCurrentPage()
+    }
+  }
+
+  /// 用同一页键重推当前页：数据仍在宿主手里（`lastMakeRows` 读的就是宿主数据源），
+  /// 代价只有一次后台整页测量。
+  ///
+  /// [精简] 删掉本类里的第二道 TiebaAdaptiveThrottle（机制本身没删，见列表侧
+  /// TiebaKindListContentView.pageMissingThrottle）：本方法的唯一调用方是列表的
+  /// onPageDataMissing，而列表侧 notifyPageDataMissing 已经用**同一个类、同样的输入**
+  /// （now / isOffScreen）做过 0.5s 起步的自适应节流 —— 同一条路上串两个同参数节流器，
+  /// 只会把间隔变成两者之积，防不住任何它单独防不住的场景。
+  /// 而且重推现在**很便宜**：行级度量缓存键 = 内容身份，重推是"内容全命中 + 重建页索引"，
+  /// 不再是整页 TextKit 重测 —— 这正是这道重复保险可以撤掉的直接原因。
+  public func republishCurrentPage() {
+    if let prepared = lastPrepared {
+      publishPrepared(
+        fresh: false, appendOnly: true, prepare: prepared.prepare, land: prepared.land)
+      return
+    }
+    guard !pageKey.isEmpty, let makeRows = lastMakeRows else { return }
+    publish(fresh: false, onLanded: lastOnLanded, makeRows: makeRows)
+  }
+
+  /// 宿主 viewDidLayoutSubviews 调用。宽度量化后与上次不同才重推（同页键）：
+  /// 首次拿到宽度时把 publish 早期暂存的请求补发。
+  public func updateWidth(_ width: CGFloat) {
+    let quantized = TiebaLayout.quantize(width)
+    guard quantized != lastWidth else { return }
+    lastWidth = quantized
+    guard !pageKey.isEmpty else { return }
+    if let prepared = lastPrepared {
+      publishPrepared(
+        fresh: false, appendOnly: true, prepare: prepared.prepare, land: prepared.land)
+      return
+    }
+    guard let makeRows = lastMakeRows else { return }
+    publish(fresh: false, onLanded: lastOnLanded, makeRows: makeRows)
+  }
+
+  /// 发布整页：fresh=true 表示"数据集合变了"。**但"追加下一页"不该换页键**——
+  /// 页键进了行标识（pageKey#index），换键 = 所有行的标识全变 ⇒ 集合视图整页
+  /// reload（可见 cell 全部销毁重建），而那正是用户滚到底触发加载的那一刻，表现
+  /// 就是"每加载一页卡一下、图还要重贴一遍"。旧行逐行未变（= 新行以旧行为前缀）
+  /// 时保持页键，只把新增的尾部 insert 进去，既有 cell 原样留着；任何一行变了
+  /// （点赞/换排序/首屏换数据/偏好变更）前缀就不成立，照旧换键整页 reload——此时
+  /// 该判据只用于**页键决策**（纯追加 → 保页键）；内容增量由列表的身份 diffable 负责。
+  /// 无宽度时先记 pending，等 updateWidth 补发。makeRows 在宽度变化时会被再次
+  /// 调用，因此是 @escaping；调用方用 `[weak self]` 闭包，避免成环。
+  ///
+  /// - Parameter onLanded: 页真正落到列表**之后**在主线程回调（搜索页用它 reveal 列表：
+  ///   必须等新页换完再显，否则会先露出上一页）。放在 makeRows 之前是为了不破坏既有的
+  ///   尾随闭包写法 `driver.publish(fresh:) { … }`。
+  public func publish<Row: TiebaRowPagePayload>(
+    fresh: Bool,
+    onLanded: (@MainActor () -> Void)? = nil,
+    makeRows: @escaping () -> [Row]
+  ) {
+    publishSeq += 1
+    let seq = publishSeq
+    let rows = makeRows().map(\.tiebaRowDictionary)
+    // 整页内容指纹算一次（O(行数)）：判"追加"与算差量共用同一份，不重复求哈希。
+    let entries = TiebaRowDiff.entries(for: rows)
+    let appendOnly = isAppend(entries)
+    if fresh, !appendOnly {
+      pageSeq += 1
+      pageKey = "\(keyPrefix)-\(pageSeq)"
+    }
+    // [收敛] 这里的整页差量计算已删除（无消费方）：增量更新由 TiebaRowDiff.Entry.identity 承担，见上方 lastRowDiff 说明。
+    guard !pageKey.isEmpty else { return }
+    // 补发用的闭包固定成字典形态（强类型载荷只在本方法内降级一次）。
+    lastMakeRows = { makeRows().map(\.tiebaRowDictionary) }
+    lastOnLanded = onLanded
+    lastPrepared = nil
+    guard lastWidth > 0 else {
+      lastRows = entries   // 宽度未就位：补发时也要能判出这是不是追加
+      return
+    }
+    let key = pageKey
+    let width = lastWidth
+    let box = RowsBox(rows: rows, entries: entries)
+    // 屏在窗上（含首屏加载期）用 userInitiated；已上过屏但现在离屏（被 push 盖住）
+    // 降到 utility——测出来也是给离屏的那一屏用，不该和滚动抢 CPU。
+    let offscreen = list.isOffScreen
+    Task { @MainActor [weak self] in
+      await Task.detached(priority: offscreen ? .utility : .userInitiated) {
+        TiebaKindRowPages.shared.prepareBlocking(
+          pageKey: key,
+          rows: box.rows,
+          containerWidth: width,
+          // [精简] 把本驱动**已经算好**的整页内容身份一起传下去：它正是行级度量缓存的键，
+          // 度量侧因此不再对同一批行重算一遍指纹（一次 O(行数) 的哈希），而且三处同键：
+          // 页面记录（族内下标）、列表身份（TiebaKindItem.identity）、度量缓存。
+          identities: box.entries.map(\.identity)
+        )
+      }.value
+      // 双重守卫：页键（换页整页重载）**+ 发布序号**（同键也要比 —— 追加/乐观点赞都不换键）。
+      guard let self, self.pageKey == key, seq > self.landedSeq else { return }
+      self.landedSeq = seq
+      self.lastRows = box.entries
+      // [采用] 把**内容身份**随页一起交给列表：diffable 据此按内容增量更新，
+      // 不再需要"同页重推就把可见行全部重配"（见 TiebaKindListView.setPage）。
+      self.list.setPage(pageKey: key, identities: box.entries.map(\.identity))
+      onLanded?()
+    }
+  }
+
+  /// 「宿主自建模型」的发布：帖子页 / 楼中楼的行模型带页级上下文（工具栏、偏好、色板、
+  /// 主贴标题、Hero 配对），**字典还原不出等价模型**，所以造模型与整页测量留在宿主。
+  /// 驱动仍然独占四件事：页键（含 fresh 换键）、宽度闸门、发布序号、回主双守卫。
+  ///
+  /// 与 `publish(fresh:onLanded:makeRows:)` 的分工：
+  ///   · 那条路的载荷是行字典，驱动自己调 `TiebaKindRowPages.prepareBlocking` 测量；
+  ///   · 这条路宿主自己测（`TiebaPostRowMetrics.prepare`），驱动只保证"哪一次的结果算数"。
+  ///
+  /// - Parameter appendOnly: 本次是否「旧行逐行未变、只是尾部追加」。fresh 且**非**追加才换
+  ///   页键 —— 换键 = 整页 reload，而"滚到底加载下一页"正好发生在这个时刻。
+  /// - Parameter prepare: 后台执行（驱动已放到 detached），参数是**本次页键与量化宽度**
+  ///   （模型构造要用它们，所以由驱动传进来，宿主不要自己再算）。宿主在这里造模型 + 测量，
+  ///   结果写进宿主持有的属性；**不要**在这里碰列表/UIKit。
+  /// - Parameter land: 双守卫（页键 + 序号）通过后回主调用，参数是本次页键。宿主在这里
+  ///   `setPage` / reveal / 滚动恢复 —— 不需要自己再比 pageKey。
+  public func publishPrepared(
+    fresh: Bool,
+    appendOnly: Bool,
+    prepare: @escaping @Sendable (_ pageKey: String, _ width: CGFloat) -> Void,
+    land: @escaping @MainActor (_ pageKey: String) -> Void
+  ) {
+    publishSeq += 1
+    let seq = publishSeq
+    if fresh, !appendOnly {
+      pageSeq += 1
+      pageKey = "\(keyPrefix)-\(pageSeq)"
+    }
+    guard !pageKey.isEmpty else { return }
+    // 两条发布路径互斥：谁发布谁就把另一条的重推闭包清掉，避免宽度变化时回放到旧路径。
+    lastMakeRows = nil
+    lastOnLanded = nil
+    lastPrepared = (prepare, land)
+    // 宽度未就位：直接返回，由 updateWidth 用 lastPrepared 以同页键补发（与字典路径同款）。
+    guard lastWidth > 0 else { return }
+    runPrepared(seq: seq, key: pageKey, prepare: prepare, land: land)
+  }
+
+  private func runPrepared(
+    seq: Int,
+    key: String,
+    prepare: @escaping @Sendable (String, CGFloat) -> Void,
+    land: @escaping @MainActor (String) -> Void
+  ) {
+    let offscreen = list.isOffScreen
+    // 宽度在进 Task 前取好：Task 里 self 是 weak，读属性要解包。
+    let width = lastWidth
+    Task { @MainActor [weak self] in
+      await Task.detached(priority: offscreen ? .utility : .userInitiated) {
+        prepare(key, width)
+      }.value
+      // 与字典路径同一套双守卫：晚到的旧页测量不得覆盖新页。
+      guard let self, self.pageKey == key, seq > self.landedSeq else { return }
+      self.landedSeq = seq
+      land(key)
+    }
+  }
+
+  /// 新行是否只是"旧行的尾部追加"（旧行逐行未变，新行更长或等长）——**基于指纹的快速路径**。
+  ///
+  /// 判据 = 内容指纹 + 同指纹序号（TiebaRowDiff.isPrefix）：只比 UInt64，不再对每行做
+  /// `(row as NSDictionary).isEqual(to:)` 的整页递归深比较；旧行指纹是上次发布时算好的
+  /// （lastRows），这里不重新求哈希；第一处不同立即返回 false（换数据 / 换排序在第 0 行
+  /// 就退，与旧实现同样的早期退出）。
+  ///
+  /// 外部语义与旧实现逐字一致：lastRows 为空（首次发布）不算追加、行数变少不算追加、
+  /// 判据仍是"整行内容逐字段相同"（不是"渲染输入相同"——后者会改变页键决策，见
+  /// TiebaRowDiff 文件头）。
+  private func isAppend(_ entries: [TiebaRowDiff.Entry]) -> Bool {
+    guard !lastRows.isEmpty else { return false }
+    return TiebaRowDiff.isPrefix(left: lastRows, right: entries)
+  }
+
+  /// 跨线程投递的入参快照盒：行字典与内容指纹都含非 Sendable 的 `[String: Any]`，
+  /// 投递后调用方不再持有 / 改写（与 TiebaKindRowPages 的 SendableRows 同约定）。
+  private struct RowsBox: @unchecked Sendable {
+    let rows: [[String: Any]]
+    let entries: [TiebaRowDiff.Entry]
+  }
+}

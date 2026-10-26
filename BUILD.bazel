@@ -1,0 +1,90 @@
+# Bazel entry point: `bazel build //:App` (simulator Debug by default, see .bazelrc).
+load("@rules_apple//apple:ios.bzl", "ios_application")
+load("@rules_xcodeproj//xcodeproj:defs.bzl", "xcodeproj")
+
+package(default_visibility = ["//visibility:public"])
+
+alias(
+    name = "TiebaNative",
+    actual = "//Sources/TiebaNative:TiebaNative",
+)
+
+ios_application(
+    name = "App",
+    app_icons = ["//TiebaLite:app_icon"],
+    bundle_id = "com.tiebalite.app",
+    bundle_name = "tiebalite",
+    entitlements = "//TiebaLite:tiebalite.entitlements",
+    # iOS 15 移植版不再内嵌 Live Activity 扩展：ActivityKit 是 iOS 16.1 起，
+    # 15 上装不进去也跑不起来（appex 的 MinimumOSVersion 会比 app 高）。
+    # 原值：extensions = ["//Extensions/TiebaLiveActivity:extension"],
+    families = [
+        "iphone",
+        "ipad",
+    ],
+    infoplists = ["//TiebaLite:app_info_plist"],
+    minimum_os_version = "15.0",
+    # Unset unless --config=device (or --define=apple.device_signing=1) is passed.
+    provisioning_profile = select({
+        "//TiebaLite:device_signing": "//Signing:profile_app",
+        "//conditions:default": None,
+    }),
+    resources = ["//TiebaLite:app_resources"],
+    # 不把 workspace 状态/git 版本烙进产物：AppleBundle 的 stamp 默认 -1（跟随 --stamp），
+    # 显式写 0 可让 action 结果在换机器/换 commit 时照样命中缓存（本仓 Info.plist 里的版本号
+    # 是静态值，没有 stamping 依赖）。
+    stamp = 0,
+    sdk_frameworks = [
+        "BackgroundTasks",
+        "CoreGraphics",
+        "ImageIO",
+        "Security",
+        "UIKit",
+    ],
+    deps = ["//TiebaLite:tiebalite_lib"],
+)
+
+xcodeproj(
+    name = "xcodeproj",
+    top_level_targets = ["//:App"],
+)
+
+# 交付用正式包：//:App 的产物做一遍符号剥离（体积约 -12%）。用法：
+#   bazel build //:AppStripped --config=ci --config=release  → bazel-bin/AppStripped.ipa
+# ⚠️ 剥离会破坏代码签名：这个包是给 SideStore 侧载用的（与 CI 的打包口径一致）；
+# 要 devicectl 直装真机就建 //:App（签名有效、符号未剥）。
+# //:App 的默认输出不止一个（IPA + dSYM），所以先按扩展名挑出 IPA。
+genrule(
+    name = "AppStripped",
+    srcs = [":App"],
+    outs = ["AppStripped.ipa"],
+    cmd = """
+set -eu
+ipa=""
+for f in $(locations :App); do
+  case "$$f" in *.ipa) ipa="$$f" ;; esac
+done
+# ── 符号剥离（原先的 Tools/strip-ipa-symbols.sh，2026-10-07 内联到这里）──
+# 为什么在 Bazel 之外做：-c opt 的 Swift 编译已经是 -O -whole-module-optimization
+# -internalize-at-link，但链接产物默认仍带符号表（实测 15.7MB 里 ~8MB 本地符号 +
+# ~4.6MB 字符串表）。Bazel 的 --objc_enable_binary_stripping 在 Bazel 7.4.0 +
+# rules_apple 4.5.3 下 analysis 期直接 NPE（Java 要取原生隐式属性 :xcode_config，
+# rules_apple 声明的是 _xcode_config）；链接期 -Wl,-x 对 private-extern 符号无效。
+# Xcode Release 的等效动作就是链接后 strip（STRIP_STYLE = Non-Global）；
+# dSYM 不受影响：Bazel 已用未剥离产物生成 dSYM，这里只处理交付副本。
+case "$$ipa" in /*) ;; *) ipa="$$PWD/$$ipa" ;; esac
+out="$$PWD/$@"
+tmp="$$(mktemp -d)"
+trap 'rm -rf "$$tmp"' EXIT
+unzip -q "$$ipa" -d "$$tmp"
+# 只剥 Mach-O（主二进制、PlugIns/*.appex、Frameworks/*）：-x 去本地符号，保留动态
+# 链接需要的全局符号（与 Xcode 的 Non-Global 档一致；-s 更狠但没必要）。
+find "$$tmp/Payload" -type f -print0 | while IFS= read -r -d '' file; do
+  case "$$(file -b "$$file")" in
+    Mach-O*) xcrun strip -x "$$file" ;;
+  esac
+done
+( cd "$$tmp" && zip -qry "$$out" Payload )
+echo "stripped: $$out ($$(wc -c <"$$out" | tr -d ' ') bytes)"
+""",
+)

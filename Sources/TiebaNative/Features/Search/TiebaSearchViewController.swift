@@ -1,0 +1,808 @@
+// 搜索页（原 src/app/search/index.tsx）：系统 UISearchBar + 贴/吧/人分段 +
+// 排序菜单 + 历史/建议 + 结果列表（贴 = 信息流行，吧/人 = 通用行）。
+import UIKit
+
+final class TiebaSearchViewController: UIViewController, TiebaNativeScreen {
+  private enum Tab: Int, CaseIterable {
+    case thread
+    case forum
+    case user
+
+    var title: String {
+      switch self {
+      case .thread: return "贴"
+      case .forum: return "吧"
+      case .user: return "人"
+      }
+    }
+  }
+
+  /// 不要标题：搜索词在搜索框里，顶栏只留返回键 + 搜索栏（用户反馈）。
+  /// 空串（而非 nil）= 显式清掉路由表的默认标题。
+  var screenTitle: String? { "" }
+
+  /// 裸 UISearchBar 挂宿主 navigationItem.titleView（占满返回键与尾随项之间的
+  /// 整条；外观/键盘/清空钮由系统承担），外套 TiebaSearchFieldBox 对齐返回键。
+  /// ⚠️ 不用 UISearchController：iOS 26 的 .integrated 把搜索栏摆到**尾随边**
+  ///（SDK 原文 "on the trailing edge"），顶栏中间空一大片（真机实证）。
+  private let searchBarBox = TiebaSearchFieldBox()
+  private var searchBar: UISearchBar { searchBarBox.searchBar }
+  private let segmented = UISegmentedControl(items: Tab.allCases.map(\.title))
+  private let sortButton = UIButton(type: .system)
+  private let sortRow = UIView()
+  /// 顶栏两行的链式约束（在 viewDidLoad 里建、在 updateChrome 里折叠）。
+  /// 折叠 = 高度与间距一起归零，见 viewDidLoad 的说明。
+  private lazy var segmentTop = segmented.topAnchor.constraint(
+    equalTo: view.safeAreaLayoutGuide.topAnchor,
+    constant: 2
+  )
+  /// 收起时给分段控件钉一个 0 高度（required 压得过内在高度 750）；展开时停用，
+  /// 回到系统内在高度。不给展开态写死常量，免得跟着系统尺寸变。
+  private lazy var segmentCollapsed = segmented.heightAnchor.constraint(equalToConstant: 0)
+  private lazy var sortTop = sortRow.topAnchor.constraint(
+    equalTo: segmented.bottomAnchor,
+    constant: 2
+  )
+  private lazy var sortHeight = sortRow.heightAnchor.constraint(equalToConstant: 34)
+  private let historyView = TiebaSearchHistoryView()
+  private let list = TiebaKindListContentView()
+  private let stateView = TiebaStateContentView()
+  private let pill = TiebaPhotoBrowserPillView()
+  /// 行页发布驱动：页键换代 / 宽度闸门 / 发布序号守卫 / 缺页自愈都归它。
+  /// 本页行源就是字典（makeRows），直接吃驱动的默认载荷，不必再手写一份发布流程。
+  private lazy var driver = TiebaRowPageDriver(list: list, keyPrefix: "search")
+
+  private var threadHits: [TiebaSearchAPI.ThreadHit] = []
+  private var forumHits: [TiebaSearchAPI.ForumHit] = []
+  private var userHits: [TiebaSearchAPI.UserHit] = []
+  private var history: [TiebaSearchHistory.Item] = []
+  private var expandedIds: Set<String> = []
+  private var likeMirror: [String: Bool] = [:]
+  private var keyword = ""
+  /// 深链带进来的初始关键词（只消费一次，见 viewDidAppear）。
+  private var initialKeyword: String
+
+  init(initialKeyword: String = "") {
+    self.initialKeyword = initialKeyword
+    super.init(nibName: nil, bundle: nil)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+  private var hasSearched = false
+  private var activeTab: Tab = .thread
+  /// 当前关键词已出结果的 tab（JS useSearchController.searchedTabsRef 同义）：
+  /// 切回已搜 tab 直接显示自己的桶，未搜 tab 才发请求并进加载态。
+  private var searchedTabs: Set<Tab> = []
+  private var order = 5
+  private var page = 1
+  /// 贴 tab 还有下一页吗。**只由贴桶写**：吧/人两桶不分页，而它跨 tab 共享（走查 D10-2）。
+  private var hasMore = false
+  private var isLoading = false
+  private var requestSeq = 0
+  /// 转场期间拿到的行宽（转场结束才交给驱动，见 viewDidLayoutSubviews / viewDidAppear）。
+  private var pendingWidth: CGFloat = 0
+  private var suggestions: [String] = []
+  /// 服务端联想词（SearchSug），随输入防抖刷新；本地历史前缀匹配在它后面补位。
+  private var remoteSuggestions: [String] = []
+  private var suggestTask: Task<Void, Never>?
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = TiebaChromeTheme.current.background
+    setupSearchBar()
+    setupSortButton()
+    historyView.onSelect = { [weak self] text in self?.commit(text) }
+    historyView.onDelete = { [weak self] text in self?.deleteHistory(text) }
+    historyView.onClear = { [weak self] in self?.clearHistory() }
+    historyView.onToggleExpand = { [weak self] in
+      guard let self else { return }
+      historyViewExpanded.toggle()
+      refreshHistory()
+    }
+    stateView.isDark = TiebaChromeTheme.current.dark
+    stateView.onButtonPress = { [weak self] _ in self?.runSearch(reset: true) }
+    // 搜索骨架：贴 tab = thread、吧/人 tab = row（原 SearchResultList.tsx count 6）
+    stateView.skeletonVariant = .thread
+    stateView.skeletonCount = 6
+    list.onListEvent = { [weak self] event in self?.handleEvent(event) }
+    // 缺页自愈：页记录/度量被别的屏的整页 LRU 挤掉时用同一页键重推（结果仍在
+    // threadHits/forumHits/… 里）。不重推的后果是行取不到内容 → 列表静默留白。
+    list.onPageDataMissing = { [weak self] in self?.driver.republishCurrentPage() }
+    segmented.selectedSegmentIndex = Tab.thread.rawValue
+    segmented.addTarget(self, action: #selector(handleTabChange), for: .valueChanged)
+
+    // ⚠️ 顶栏两行的折叠必须靠「高度 + 前后间距一起归零」，不能用竖向栈：裸 isHidden
+    // 不撤销约束会白占约 70pt，而栈在「三个内容区同时隐藏」的那一帧（切 tab 时
+    // stateView 先藏、列表还没 reveal）会把剩余高度全分给分段行，UISegmentedControl
+    // 被拉成整屏椭圆、内容区被挤成 0 高（真机截图实证）。扁平绝对约束没有这个歧义。
+    sortRow.addSubview(sortButton)
+    for subview in [segmented, sortRow, historyView, list, stateView, pill] as [UIView] {
+      subview.translatesAutoresizingMaskIntoConstraints = false
+      view.addSubview(subview)
+    }
+    sortButton.translatesAutoresizingMaskIntoConstraints = false
+    NSLayoutConstraint.activate([
+      segmented.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
+      segmented.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+      segmentTop,
+      sortRow.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      sortRow.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      sortTop,
+      sortHeight,
+      sortButton.leadingAnchor.constraint(equalTo: sortRow.leadingAnchor, constant: 16),
+      sortButton.centerYAnchor.constraint(equalTo: sortRow.centerYAnchor),
+      historyView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      historyView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      historyView.topAnchor.constraint(equalTo: sortRow.bottomAnchor),
+      historyView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      list.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      list.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      list.topAnchor.constraint(equalTo: sortRow.bottomAnchor),
+      list.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      stateView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      stateView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      stateView.topAnchor.constraint(equalTo: sortRow.bottomAnchor),
+      stateView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      pill.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      pill.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
+      pill.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.82),
+      pill.widthAnchor.constraint(lessThanOrEqualToConstant: TiebaLayout.floatingMaxWidth),
+    ])
+    list.isHidden = true
+    stateView.isHidden = true
+    refreshHistory()
+    updateChrome()
+  }
+
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    // 出现动画落定后才做行测量/设页：转场期间 publish 会在推入动画里做整页测量 +
+    // 快照 apply，直接表现成搜索栏弹出时掉帧（真机反馈）。
+    // 转场期间记账的宽度在这里补交给驱动（驱动内部判"宽度真变了才重推"，也会把
+    // 宽度未就位时暂存的那次发布连同 reveal 钩子一起补发）。
+    if pendingWidth > 0 {
+      let width = pendingWidth
+      pendingWidth = 0
+      driver.updateWidth(width)
+    }
+    // 深链带关键词（tiebalite://search?q=…）：出现后直接出结果，不再抢焦点。
+    if !initialKeyword.isEmpty, !hasSearched {
+      let keyword = initialKeyword
+      initialKeyword = ""
+      commit(keyword)
+    }
+  }
+
+  override func viewDidLayoutSubviews() {
+    super.viewDidLayoutSubviews()
+    // 行宽契约 = 列表宽 − 2×horizontalInset（内缩含居中留白），量化走全仓唯一实现。
+    // 宽度变化（旋转/分屏）必须按新宽度重测重推：行高按精确宽度键控，旧宽度的度量
+    // 会被宽度闸门拒绝 —— 这条重推由驱动负责（它自己判"量化宽度真变了才重推"）。
+    let width = TiebaLayout.quantize(list.bounds.width - list.horizontalInset * 2)
+    // 转场未结束时只记账（见 viewDidAppear）：transitionCoordinator 非 nil 期间
+    // 布局每次变化都会走这里，就地重推会把整页 TextKit 测量压进推入动画。
+    if transitionCoordinator == nil {
+      driver.updateWidth(width)
+    } else {
+      pendingWidth = width
+    }
+    list.contentInsetBottom = view.safeAreaInsets.bottom + 16
+  }
+
+  // MARK: - 顶部控件
+
+  /// 搜索栏挂宿主 navigationItem.titleView（本屏 chrome = .standard，宿主即栈里那屏）。
+  private func setupSearchBar() {
+    searchBar.delegate = self
+    searchBar.placeholder = "搜吧、搜贴、搜人"
+    searchBar.returnKeyType = .search
+    searchBar.autocorrectionType = .no
+    searchBar.autocapitalizationType = .none
+    guard let host = parent as? TiebaRouteHostViewController else {
+      preconditionFailure("搜索页必须挂在 TiebaRouteHostViewController 下")
+    }
+    host.navigationItem.titleView = searchBarBox
+  }
+
+  private func setupSortButton() {
+    var config = UIButton.Configuration.plain()
+    config.image = UIImage(systemName: "chevron.down")
+    config.imagePlacement = .trailing
+    config.imagePadding = 4
+    config.contentInsets = NSDirectionalEdgeInsets(top: 4, leading: 4, bottom: 4, trailing: 4)
+    sortButton.configuration = config
+    sortButton.showsMenuAsPrimaryAction = true
+    rebuildSortMenu()
+  }
+
+  private func rebuildSortMenu() {
+    let options: [(value: Int, title: String)] = [(5, "按时间"), (2, "按相关性")]
+    let actions = options.map { option in
+      UIAction(
+        title: option.title,
+        state: order == option.value ? .on : .off
+      ) { [weak self] _ in
+        guard let self, order != option.value else { return }
+        order = option.value
+        rebuildSortMenu()
+        if !keyword.isEmpty { runSearch(reset: true) }
+      }
+    }
+    sortButton.menu = UIMenu(children: actions)
+    var config = sortButton.configuration
+    config?.title = options.first { $0.value == order }?.title ?? "按时间"
+    sortButton.configuration = config
+  }
+
+  private var historyViewExpanded = false
+
+  private func updateChrome() {
+    // 聚焦就进历史/建议区（含"搜索后再点搜索框改词"，输入中的联想词才有地方显示）；
+    // 收起键盘（commit / 滚动列表）立刻回到结果列表。
+    let editing = searchBar.isFirstResponder
+    let showHistory = !hasSearched || editing
+    let showSegment = hasSearched
+    let showSort = hasSearched && activeTab == .thread
+    segmented.isHidden = !showSegment
+    sortRow.isHidden = !showSort
+    // 高度与间距一起归零才算真收起（内容区是绝对约束，跟着 sortRow 底边走）。
+    segmentTop.constant = showSegment ? 2 : 0
+    segmentCollapsed.isActive = !showSegment
+    sortTop.constant = showSort ? 2 : 0
+    sortHeight.constant = showSort ? 34 : 0
+    historyView.isHidden = !showHistory
+    if showHistory {
+      list.isHidden = true
+      stateView.isHidden = true
+    } else if let currentState {
+      // 退出编辑态要把结果区按原状态放回来：只藏不还原（清空后又输入）会剩下
+      // 整块空白——historyView 藏了、列表还被关着。
+      showState(currentState)
+    } else {
+      showList()
+    }
+  }
+
+  // MARK: - 历史
+
+  private func refreshHistory() {
+    history = TiebaSearchHistory.load(forumId: nil, limit: 20)
+    refreshSuggestionDisplay()
+  }
+
+  /// 建议区 = 服务端联想词在前，本地历史前缀匹配补位（去重，最多 8 条）。
+  private func currentSuggestions() -> [String] {
+    let text = (searchBar.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else { return [] }
+    // 服务端联想词直接采信（它们就是为这个词生成的，未必前缀命中）；历史只补前缀命中。
+    // 前缀比对除了原样，再比一遍**折叠形**（小写 + 去重音 + 西里尔/希腊/汉字转拉丁）：
+    // 俄语吧名「Москва」敲 moskva 能命中，反过来敲「МОСКВА」也能被 mosk 命中。
+    // 只放宽本地历史，不动发给服务端的查询词——服务端按原词检索，客户端改不了它的规则。
+    let foldedQuery = TiebaTransliteration.searchFolded(text)
+    let localMatches = history.map(\.keyword).filter { keyword in
+      if keyword.hasPrefix(text) { return true }
+      guard !foldedQuery.isEmpty else { return false }
+      return TiebaTransliteration.searchFolded(keyword).hasPrefix(foldedQuery)
+    }
+    var seen: Set<String> = []
+    var out: [String] = []
+    for candidate in remoteSuggestions + localMatches where !candidate.isEmpty {
+      if seen.insert(candidate).inserted { out.append(candidate) }
+      if out.count >= 8 { break }
+    }
+    return out
+  }
+
+  private func refreshSuggestionDisplay() {
+    suggestions = currentSuggestions()
+    historyView.configure(
+      suggestions: suggestions,
+      history: history,
+      expanded: historyViewExpanded
+    )
+  }
+
+  /// 输入联想：250ms 防抖 + 词一致才落库（旧请求回来时输入已变则丢弃）。
+  private func scheduleSuggestions(for text: String) {
+    suggestTask?.cancel()
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else {
+      remoteSuggestions = []
+      refreshSuggestionDisplay()
+      return
+    }
+    suggestTask = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: 250_000_000)
+      guard !Task.isCancelled else { return }
+      let list = (try? await TiebaSearchAPI.suggest(word: trimmed)) ?? []
+      guard let self, !Task.isCancelled else { return }
+      let current = (self.searchBar.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+      guard current == trimmed else { return }
+      self.remoteSuggestions = list
+      self.refreshSuggestionDisplay()
+    }
+  }
+
+  private func deleteHistory(_ text: String) {
+    history = TiebaSearchHistory.remove(keyword: text, forumId: nil, limit: 20)
+    refreshHistory()
+  }
+
+  private func clearHistory() {
+    TiebaSceneHaptics.fire("destructive")
+    TiebaSearchHistory.clear(forumId: nil)
+    refreshHistory()
+  }
+
+  // MARK: - 搜索
+
+  @objc private func handleTabChange() {
+    guard let next = Tab(rawValue: segmented.selectedSegmentIndex), next != activeTab else { return }
+    TiebaSceneHaptics.fire("segment")
+    activeTab = next
+    updateChrome()
+    guard hasSearched, !keyword.isEmpty else { return }
+    // JS selectTab：已搜过的 tab 直接显示自己的桶（零请求），未搜的才发起。
+    // 旧实现按 currentCount 传 silent 重搜 → 列表页仍挂在上一 tab，切过去
+    // 看不到加载态、只看到旧 tab 结果（用户反馈）。
+    if searchedTabs.contains(next) {
+      showCurrentTabContent()
+    } else {
+      runSearch(reset: true)
+    }
+  }
+
+  /// 切回已搜 tab：立即上该 tab 自己的桶（空桶 = 空态，有行 = 列表）。
+  private func showCurrentTabContent() {
+    if currentCount == 0 {
+      showState(.empty(image: "doc.text.magnifyingglass", text: emptyText, retryTitle: "重试"))
+      return
+    }
+    list.footerState = activeTab == .thread && hasMore ? .more : .none
+    // 行测量 + 设页完成后才显示（reveal）：否则上一 tab 的旧页会多停一帧。
+    stateView.isHidden = true
+    publish(fresh: true, reveal: true)
+  }
+
+  private func commit(_ text: String) {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    searchBar.text = trimmed
+    searchBar.resignFirstResponder()
+    suggestTask?.cancel()
+    remoteSuggestions = []
+    suggestions = []
+    // 历史写盘（3 条写 + 重读）不在主线程同步跑；回来后只更内存副本。
+    Task { @MainActor in
+      history = await TiebaSearchHistory.append(keyword: trimmed, forumId: nil, limit: 20)
+    }
+    if trimmed == keyword, hasSearched { return }
+    keyword = trimmed
+    hasSearched = true
+    // 新关键词：三桶全清 + 已搜集合只剩当前 tab（JS commitKeyword 同）。
+    threadHits = []
+    forumHits = []
+    userHits = []
+    searchedTabs = [activeTab]
+    expandedIds = []
+    updateChrome()
+    runSearch(reset: true)
+  }
+
+  /// 结果区当前在显示什么（nil = 列表）：退出编辑态时按它还原（见 updateChrome）。
+  private var currentState: TiebaState?
+
+  private func showState(_ state: TiebaState) {
+    if case .loading = state {
+      // 贴 tab 的真实行是 TweetCard → thread 同形；吧/人 = 通用行
+      stateView.skeletonVariant = activeTab == .thread ? .thread : .row
+    }
+    currentState = state
+    stateView.state = state
+    stateView.isHidden = false
+    list.isHidden = true
+  }
+
+  private func showList() {
+    currentState = nil
+    stateView.isHidden = true
+    list.isHidden = false
+  }
+
+  private func runSearch(reset: Bool) {
+    guard !keyword.isEmpty else { return }
+    // 下一页页码只在成功后提交：失败不回退就会跳过一页（page 保持原值可重试）。
+    let requestPage = reset ? 1 : page + 1
+    if reset { page = 1 }
+    requestSeq += 1
+    let seq = requestSeq
+    let target = activeTab
+    isLoading = true
+    if reset {
+      // 只清当前桶：切 tab / 换排序重搜时其它桶的已有结果保留（与旧页同）。
+      switch target {
+      case .thread: threadHits = []
+      case .forum: forumHits = []
+      case .user: userHits = []
+      }
+      expandedIds = []
+      publish(fresh: true)
+      // 桶已清空 → 立即加载态（不再沿用上一 tab 留在屏上的列表页）。
+      showState(.loading)
+    }
+    Task { @MainActor in
+      defer {
+        if seq == requestSeq { isLoading = false }
+      }
+      do {
+        switch target {
+        case .thread:
+          let result = try await TiebaSearchAPI.threads(keyword: keyword, page: requestPage, order: order)
+          guard seq == requestSeq else { return }
+          if reset {
+            threadHits = result.hits
+          } else {
+            threadHits.append(contentsOf: result.hits)
+          }
+          page = requestPage
+          hasMore = result.hasMore
+        // 吧/人两桶不分页，**不写 hasMore**：它跨 tab 共享，这里清零会把贴桶的分页游标
+        // 一起抹掉——切回贴 tab 后页脚变 .none、loadMore 直接被拒（走查 D10-2）。
+        // 两桶的页脚本来就由 target == .thread 判定压成 .none，不需要它参与。
+        case .forum:
+          let hits = try await TiebaSearchAPI.forums(keyword: keyword)
+          guard seq == requestSeq else { return }
+          forumHits = hits
+        case .user:
+          let hits = try await TiebaSearchAPI.users(keyword: keyword)
+          guard seq == requestSeq else { return }
+          userHits = hits
+        }
+        searchedTabs.insert(target)
+        // 只有目标 tab 还是当前 tab 才动 UI：切到已缓存 tab 期间到达的响应
+        // 只落桶，屏上显示的是新 activeTab 自己的内容。
+        if target == activeTab {
+          if currentCount == 0 {
+            showState(.empty(image: "doc.text.magnifyingglass", text: emptyText, retryTitle: "重试"))
+          } else {
+            list.footerState = target == .thread && hasMore ? .more : .none
+            // 设页完成后再显示：新页落位前不露出上一 tab 的旧页。
+            publish(fresh: true, reveal: true)
+          }
+          if reset, isUserRefresh { TiebaSceneHaptics.fire("toggle") }
+        }
+      } catch {
+        guard seq == requestSeq else { return }
+        if target == activeTab, currentCount == 0 {
+          showState(.error(message: error.localizedDescription))
+        } else if target == activeTab {
+          // 已有结果时静默失败：底部 loadMore 态要复位，否则 spinner 卡住。
+          list.footerState = target == .thread && hasMore ? .more : .none
+          pill.showResult(success: false, text: "加载失败")
+        }
+      }
+      isUserRefresh = false
+      list.endRefreshing()
+    }
+  }
+
+  private var isUserRefresh = false
+
+  private var currentCount: Int {
+    switch activeTab {
+    case .thread: return threadHits.count
+    case .forum: return forumHits.count
+    case .user: return userHits.count
+    }
+  }
+
+  private var emptyText: String {
+    switch activeTab {
+    case .thread: return "未找到相关贴子"
+    case .forum: return "未找到相关贴吧"
+    case .user: return "未找到相关用户"
+    }
+  }
+
+  private func loadMore() {
+    guard activeTab == .thread, hasMore, !isLoading else { return }
+    list.footerState = .loading
+    runSearch(reset: false)
+  }
+
+  // MARK: - 发布行
+
+  /// 造行 + 发布交给驱动：页键换代、宽度闸门、序号守卫、后台整页测量、换页全在驱动里，
+  /// 本页只提供行源与"新页落地后要不要露出列表"。
+  private func publish(fresh: Bool, reveal: Bool = false) {
+    // reveal 必须等新页真正落到列表之后再做：否则上一 tab 的旧页会多停一帧。
+    // 宽度未就位时驱动会把这次发布连同钩子一起暂存，补发落地时同样会回调它。
+    var onLanded: (@MainActor () -> Void)?
+    if reveal {
+      onLanded = { [weak self] in self?.showList() }
+    }
+    driver.publish(
+      fresh: fresh,
+      onLanded: onLanded,
+      makeRows: { [weak self] in self?.makeRows() ?? [] }
+    )
+  }
+
+  private func makeRows() -> [[String: Any]] {
+    switch activeTab {
+    case .thread:
+      return threadHits.map { hit in
+        var row = hit.row
+        row["expanded"] = expandedIds.contains(hit.id)
+        return row
+      }
+    case .forum:
+      return forumHits.map { themed($0.row) }
+    case .user:
+      return userHits.map { themed($0.row) }
+    }
+  }
+
+  /// 通用行的主题色（发布时注入：深色/自定义主题下卡片底与描边才正确）。
+  private func themed(_ row: [String: Any]) -> [String: Any] {
+    var row = row
+    row["colors"] = TiebaRowTheme.colors()
+    return row
+  }
+
+  // MARK: - 事件
+
+  private func handleEvent(_ event: TiebaKindListEvent) {
+    switch event {
+    case .rowTap(let index, let region, let actionIndex):
+      handleRowTap(index: index, region: region, actionIndex: actionIndex)
+    case .menuAction(let index, let action):
+      handleMenuAction(index: index, action: action)
+    case .mediaAction(let index, _, let action, let url, let originURL):
+      handleMediaAction(index: index, action: action, url: url, originURL: originURL)
+    case .reachEnd, .footerTap:
+      loadMore()
+    case .refreshRequested:
+      isUserRefresh = true
+      runSearch(reset: true)
+    default:
+      break
+    }
+  }
+
+  private func handleRowTap(index: Int, region: String, actionIndex: Int?) {
+    switch activeTab {
+    case .thread:
+      guard threadHits.indices.contains(index) else { return }
+      let thread = threadHits[index]
+      switch region {
+      case "chip":
+        let forumName = TiebaSimpleRowParser.string(thread.row["forumName"]) ?? ""
+        guard !forumName.isEmpty else { return }
+        TiebaNavigator.shared.navigate(.forum(name: forumName))
+      case "action":
+        switch actionIndex {
+        case 1: shareThread(thread)
+        case 2: toggleLike(thread, index: index)
+        default: openThread(thread)
+        }
+      case "showMore":
+        guard !thread.id.isEmpty, expandedIds.insert(thread.id).inserted else { return }
+        TiebaSceneHaptics.fire("toggle")
+        publish(fresh: true)
+      case "quote":
+        // 转发引用卡 → 原帖；老数据缺 tid 退回整卡进帖。
+        if let quoteId = TiebaFeedRowInteraction.quotedThreadId(in: thread.row) {
+          TiebaSceneHaptics.fire("press")
+          TiebaNavigator.shared.navigate(.thread(id: quoteId))
+        } else {
+          openThread(thread)
+        }
+      default:
+        openThread(thread)
+      }
+    case .forum:
+      guard forumHits.indices.contains(index) else { return }
+      let name = forumHits[index].name
+      guard !name.isEmpty else { return }
+      TiebaSceneHaptics.fire("press")
+      TiebaNavigator.shared.navigate(.forum(name: name))
+    case .user:
+      guard userHits.indices.contains(index) else { return }
+      let uid = userHits[index].uid
+      guard !uid.isEmpty else { return }
+      TiebaSceneHaptics.fire("press")
+      TiebaNavigator.shared.navigate(.user(uid: uid))
+    }
+  }
+
+  private func handleMenuAction(index: Int, action: String) {
+    guard activeTab == .thread, threadHits.indices.contains(index) else { return }
+    let thread = threadHits[index]
+    switch action {
+    case "block":
+      blockAuthor(thread)
+    case "dislike":
+      presentDislikeSheet(thread, index: index)
+    case "copy-title":
+      let title = TiebaSimpleRowParser.string(thread.row["title"]) ?? ""
+      guard !title.isEmpty else { return }
+      TiebaClipboard.setString(title)
+    default:
+      break
+    }
+  }
+
+  /// 行内图片长按菜单（保存照片 / 分享照片）：url 优先 originURL（空串按缺省，
+  /// 与旧 payload 判读同）。
+  private func handleMediaAction(index: Int, action: String, url: String?, originURL: String?) {
+    guard activeTab == .thread, threadHits.indices.contains(index) else { return }
+    let source = (originURL.flatMap { $0.isEmpty ? nil : $0 }) ?? url ?? ""
+    guard !source.isEmpty else { return }
+    let forumName = TiebaSimpleRowParser.string(threadHits[index].row["forumName"]) ?? ""
+    if action == "save-image" {
+      TiebaFeedImageActions.save(url: source, forumName: forumName, presenter: self)
+    } else {
+      TiebaFeedImageActions.share(
+        url: source,
+        forumName: forumName,
+        presenter: self,
+        sourceRect: CGRect(x: view.bounds.midX, y: view.bounds.maxY - 40, width: 1, height: 1)
+      )
+    }
+  }
+
+  /// 不感兴趣：原因面板 → 上报 → 折叠退场（与动态流同一面板类/上报接口）。
+  private func presentDislikeSheet(_ hit: TiebaSearchAPI.ThreadHit, index: Int) {
+    TiebaSceneHaptics.fire("sheet-present")
+    let sheet = TiebaDislikeSheetViewController { [weak self] ids in
+      self?.submitDislike(hit, index: index, ids: ids)
+    }
+    present(sheet, animated: true)
+  }
+
+  private func submitDislike(_ hit: TiebaSearchAPI.ThreadHit, index: Int, ids: String) {
+    guard !hit.id.isEmpty else { return }
+    let forumId = TiebaSimpleRowParser.string(hit.row["forumId"]) ?? ""
+    Task { @MainActor in
+      do {
+        try await TiebaFeedAPI.submitDislike(
+          threadId: hit.id,
+          dislikeIds: ids,
+          forumId: forumId
+        )
+        TiebaSceneHaptics.fire("action-success")
+        // 先折叠再删（原 JS collapsingId + 360ms 兜底）：下面卡片等新快照补位。
+        list.collapseRowThen(atIndex: index) { [weak self] in
+          guard let self else { return }
+          threadHits.removeAll { $0.id == hit.id }
+          if threadHits.isEmpty {
+            showState(.empty(image: "doc.text.magnifyingglass", text: emptyText, retryTitle: "重试"))
+          } else {
+            publish(fresh: true)
+          }
+        }
+      } catch {
+        TiebaSceneHaptics.fire("action-fail")
+        pill.showResult(success: false, text: "提交失败，请稍后重试")
+      }
+    }
+  }
+
+  private func openThread(_ hit: TiebaSearchAPI.ThreadHit) {
+    guard !hit.id.isEmpty else { return }
+    TiebaSceneHaptics.fire("press")
+    TiebaNavigator.shared.navigate(.thread(id: hit.id))
+  }
+
+  private func shareThread(_ hit: TiebaSearchAPI.ThreadHit) {
+    let url = "https://tieba.baidu.com/p/\(hit.id)"
+    let title = TiebaSimpleRowParser.string(hit.row["title"]) ?? ""
+    TiebaShareSheet.present(text: title.isEmpty ? url : "\(title)\n\(url)", from: self)
+  }
+
+  private func toggleLike(_ hit: TiebaSearchAPI.ThreadHit, index: Int) {
+    guard !hit.id.isEmpty else { return }
+    guard !TiebaBackgroundSnapshot.shared.bduss.isEmpty else {
+      TiebaNavigator.shared.navigate(.login)
+      return
+    }
+    let latest = likeMirror[hit.id] ?? (TiebaSimpleRowParser.bool(hit.row["hasAgree"]) ?? false)
+    let next = !latest
+    likeMirror[hit.id] = next
+    TiebaSceneHaptics.fire("like")
+    applyLike(index, next)
+    Task { @MainActor in
+      do {
+        try await TiebaThreadActionAPI.setAgree(threadId: hit.id, postId: hit.id, agree: next)
+        TiebaSceneHaptics.fire("action-success")
+        pill.showResult(success: true, text: next ? "点赞成功" : "已取消点赞")
+      } catch {
+        if let vmError = error as? TiebaViewModelError, vmError.message.contains("点过赞") {
+          TiebaSceneHaptics.fire("action-success")
+          return
+        }
+        TiebaSceneHaptics.fire("action-fail")
+        likeMirror[hit.id] = latest
+        applyLike(index, latest)
+        pill.showResult(success: false, text: "点赞失败，请稍后重试")
+      }
+    }
+  }
+
+  private func applyLike(_ index: Int, _ liked: Bool) {
+    guard threadHits.indices.contains(index) else { return }
+    var row = threadHits[index].row
+    row["hasAgree"] = liked
+    let count = TiebaSimpleRowParser.double(row["zanNum"]) ?? 0
+    row["zanNum"] = max(0, count + (liked ? 1 : -1))
+    threadHits[index].row = row
+    publish(fresh: false)
+  }
+
+  private func blockAuthor(_ hit: TiebaSearchAPI.ThreadHit) {
+    let uid = TiebaSimpleRowParser.string(hit.row["authorId"]) ?? ""
+    guard !uid.isEmpty else { return }
+    let name = TiebaSimpleRowParser.string(hit.row["authorName"]) ?? ""
+    let user = TiebaBlockedUser(
+      id: String(Int(Date().timeIntervalSince1970 * 1000)),
+      uid: uid,
+      username: name.isEmpty ? nil : name
+    )
+    do {
+      try TiebaBlockStore.add(user: user)
+    } catch {
+      TiebaSceneHaptics.fire("action-fail")
+      return
+    }
+    TiebaSceneHaptics.fire("action-success")
+    threadHits.removeAll { $0.id == hit.id }
+    if threadHits.isEmpty {
+      showState(.empty(image: "doc.text.magnifyingglass", text: emptyText, retryTitle: "重试"))
+    } else {
+      publish(fresh: true)
+    }
+  }
+}
+
+// MARK: - UISearchBarDelegate
+
+extension TiebaSearchViewController: UISearchBarDelegate {
+  func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
+    // 编辑态决定历史/建议区可见性（聚焦显示建议，收起键盘回结果）。
+    updateChrome()
+    scheduleSuggestions(for: searchText)
+    refreshSuggestionDisplay()
+  }
+
+  func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
+    // 裸 UISearchBar 默认不显示取消按钮（只有 UISearchController 才自带）：不打开的话
+    // 下面 searchBarCancelButtonClicked 的「空文本点取消=返回」整段永远不可达。
+    searchBar.showsCancelButton = true
+    updateChrome()
+    refreshSuggestionDisplay()
+  }
+
+  func searchBarTextDidEndEditing(_ searchBar: UISearchBar) {
+    searchBar.showsCancelButton = false
+    updateChrome()
+  }
+
+  func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
+    searchBar.resignFirstResponder()
+    commit(searchBar.text ?? "")
+  }
+
+  func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
+    searchBar.resignFirstResponder()
+    if (searchBar.text ?? "").isEmpty {
+      TiebaNavigator.shared.goBack()
+      return
+    }
+    searchBar.text = ""
+    suggestTask?.cancel()
+    remoteSuggestions = []
+    refreshHistory()
+  }
+}

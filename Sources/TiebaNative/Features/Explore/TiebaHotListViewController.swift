@@ -1,0 +1,1293 @@
+// 发现 tab 的「热榜」段（原 src/components/explore/HotListContent.tsx）：热门话题
+// 横向胶囊 + 分类 Tab + 排名帖列表；数据 TiebaFeedAPI.hotThreadList。
+import UIKit
+
+final class TiebaHotListViewController: UIViewController, TiebaTabReselectable {
+  private lazy var collectionView = UICollectionView(frame: .zero, collectionViewLayout: makeLayout())
+  private let refreshControl = UIRefreshControl()
+  private let stateView = TiebaStateContentView()
+  private let pill = TiebaPhotoBrowserPillView()
+  /// 供发现页 chrome 收缩的只读滚动位置。
+  private(set) var chromeScrollOffsetY: CGFloat = 0
+  var onChromeScrollChange: ((CGFloat) -> Void)?
+  private var needsTopAnchorAfterRefresh = false
+  private var topAnchorGeneration = 0
+
+  private var topics: [TiebaFeedAPI.Hot.Topic] = []
+  private var tabs: [TiebaFeedAPI.Hot.Tab] = []
+  private var threads: [TiebaFeedAPI.Hot.Thread] = []
+  private var activeTab = "all"
+  private var isReloading = false
+  /// 请求代号：加载中点第二个分类时旧响应必须丢弃（否则列表停在旧 tab）。
+  private var requestSeq = 0
+
+  override func viewDidLoad() {
+    super.viewDidLoad()
+    view.backgroundColor = .clear
+    stateView.isDark = TiebaChromeTheme.current.dark
+    stateView.tintColor = TiebaExploreSurface.brandForeground
+    stateView.onButtonPress = { [weak self] _ in self?.reload() }
+    stateView.isHidden = true
+    // 热榜骨架：通用列表行（原 HotListContent.tsx variant="row" count={8}）
+    stateView.skeletonVariant = .row
+    stateView.skeletonInsets = UIEdgeInsets(top: 8, left: 16, bottom: 0, right: 16)
+    collectionView.backgroundColor = .clear
+    collectionView.dataSource = self
+    collectionView.delegate = self
+    collectionView.alwaysBounceVertical = true
+    collectionView.contentInsetAdjustmentBehavior = .never
+    collectionView.decelerationRate = TiebaMotionSpec.Scroll.systemDecelerationRate
+    collectionView.register(TiebaHotListCell.self, forCellWithReuseIdentifier: TiebaHotListCell.reuseIdentifier)
+    collectionView.register(
+      TiebaHotHeaderView.self,
+      forSupplementaryViewOfKind: UICollectionView.elementKindSectionHeader,
+      withReuseIdentifier: TiebaHotHeaderView.reuseIdentifier
+    )
+    collectionView.register(
+      TiebaHotFooterView.self,
+      forSupplementaryViewOfKind: UICollectionView.elementKindSectionFooter,
+      withReuseIdentifier: TiebaHotFooterView.reuseIdentifier
+    )
+    refreshControl.tintColor = TiebaChromeTheme.current.tint
+    refreshControl.addTarget(self, action: #selector(handleRefreshControl), for: .valueChanged)
+    collectionView.refreshControl = refreshControl
+    for subview in [collectionView, stateView, pill] as [UIView] {
+      subview.translatesAutoresizingMaskIntoConstraints = false
+      view.addSubview(subview)
+    }
+    NSLayoutConstraint.activate([
+      collectionView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      collectionView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      collectionView.topAnchor.constraint(equalTo: view.topAnchor),
+      collectionView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      stateView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      stateView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      stateView.topAnchor.constraint(equalTo: view.topAnchor),
+      stateView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+      pill.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      pill.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16),
+      pill.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.82),
+      pill.widthAnchor.constraint(lessThanOrEqualToConstant: TiebaLayout.floatingMaxWidth),
+    ])
+    showState(.loading)
+    reload()
+  }
+
+  override func viewSafeAreaInsetsDidChange() {
+    super.viewSafeAreaInsetsDidChange()
+    collectionView.contentInset.top = TiebaExploreSurface.pageTopInset
+    collectionView.contentInset.bottom = view.safeAreaInsets.bottom + TiebaExploreSurface.pageBottomExtra
+  }
+
+  // MARK: - 布局
+
+  /// 单列内容行：全宽 systemBackground 行 + 16pt 内白 + 底部 1 物理像素 hairline，
+  /// 不再用带外边距的灰白大卡。行高/页头/页脚仍自撑。
+  private func makeLayout() -> UICollectionViewCompositionalLayout {
+    let configuration = UICollectionViewCompositionalLayoutConfiguration()
+    configuration.interSectionSpacing = 0
+    return UICollectionViewCompositionalLayout(sectionProvider: { _, _ in
+      let itemSize = NSCollectionLayoutSize(
+        widthDimension: .fractionalWidth(1),
+        heightDimension: .estimated(150)
+      )
+      let item = NSCollectionLayoutItem(layoutSize: itemSize)
+      let group = NSCollectionLayoutGroup.vertical(layoutSize: itemSize, subitems: [item])
+      let section = NSCollectionLayoutSection(group: group)
+      section.interGroupSpacing = 0
+      section.contentInsets = .zero
+      section.boundarySupplementaryItems = [
+        NSCollectionLayoutBoundarySupplementaryItem(
+          layoutSize: NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1),
+            heightDimension: .estimated(120)
+          ),
+          elementKind: UICollectionView.elementKindSectionHeader,
+          alignment: .top
+        ),
+        NSCollectionLayoutBoundarySupplementaryItem(
+          layoutSize: NSCollectionLayoutSize(
+            widthDimension: .fractionalWidth(1),
+            heightDimension: .estimated(146)
+          ),
+          elementKind: UICollectionView.elementKindSectionFooter,
+          alignment: .bottom
+        ),
+      ]
+      return section
+    }, configuration: configuration)
+  }
+
+  // MARK: - 外部驱动（tab 根屏）
+
+  /// 底栏重复点击（用户口径）：不在顶部 → 只回顶，不刷新；已在顶部 → 顶部
+  /// 展示刷新动画并重拉。
+  func tabReselected() {
+    TiebaSceneHaptics.fire("press")
+    let top = -collectionView.adjustedContentInset.top
+    guard collectionView.contentOffset.y <= top + 0.5 else {
+      collectionView.setContentOffset(
+        CGPoint(x: 0, y: top),
+        animated: UIAccessibility.isReduceMotionEnabled == false
+      )
+      return
+    }
+    guard refreshControl.isRefreshing == false else { return }
+    needsTopAnchorAfterRefresh = true
+    refreshControl.beginRefreshing()
+    // 与 KindList 同款：refreshControl 未布局时 bounds.height 可能为 0，偏移量取 0 就
+    // 等于「只 beginRefreshing 不滚」，用户看不到刷新动画（同仓 KindList 已用 44 兜底）。
+    collectionView.setContentOffset(
+      CGPoint(x: 0, y: top - max(refreshControl.bounds.height, 44)),
+      animated: UIAccessibility.isReduceMotionEnabled == false
+    )
+    reload()
+  }
+
+  // MARK: - 状态
+
+  private func showState(_ state: TiebaState, animated: Bool = false) {
+    let wasShowingList = collectionView.isHidden == false
+    let shouldAnimate = animated
+      && wasShowingList
+      && UIAccessibility.isReduceMotionEnabled == false
+      && view.window != nil
+    stateView.state = state
+    stateView.isHidden = false
+    if shouldAnimate {
+      stateView.alpha = 0
+      TiebaAnimation.animate(
+        curve: .easeOut,
+        duration: TiebaAnimationDuration.stateChange,
+        options: [.beginFromCurrentState, .allowUserInteraction],
+        animations: {
+          self.collectionView.alpha = 0
+          self.stateView.alpha = 1
+        },
+        completion: { _ in
+          self.collectionView.isHidden = true
+          self.collectionView.alpha = 1
+          self.stateView.alpha = 1
+        }
+      )
+    } else {
+      collectionView.isHidden = true
+      collectionView.alpha = 1
+      stateView.alpha = 1
+    }
+  }
+
+  private func showList() {
+    let fromState = stateView.isHidden == false
+    collectionView.isHidden = false
+    scheduleTopAnchorAfterRefresh()
+    let shouldAnimate = fromState
+      && UIAccessibility.isReduceMotionEnabled == false
+      && view.window != nil
+    guard shouldAnimate else {
+      stateView.isHidden = true
+      stateView.alpha = 1
+      collectionView.alpha = 1
+      collectionView.transform = .identity
+      return
+    }
+    collectionView.alpha = 0
+    collectionView.transform = CGAffineTransform(translationX: 0, y: 6)
+    TiebaAnimation.animate(
+      curve: .easeOut,
+      duration: TiebaAnimationDuration.stateChange,
+      options: [.beginFromCurrentState, .allowUserInteraction],
+      animations: {
+        self.collectionView.alpha = 1
+        self.collectionView.transform = .identity
+        self.stateView.alpha = 0
+      },
+      completion: { _ in
+        self.stateView.isHidden = true
+        self.stateView.alpha = 1
+        self.collectionView.alpha = 1
+        self.collectionView.transform = .identity
+        self.scheduleTopAnchorAfterRefresh()
+      }
+    )
+  }
+
+  /// 刷新成功后的可验证 top anchor：立即 + 布局后 + 下一轮主队列各锁一次。
+  private func cancelPendingTopAnchorRefresh() {
+    topAnchorGeneration += 1
+    needsTopAnchorAfterRefresh = false
+  }
+
+  private func scheduleTopAnchorAfterRefresh() {
+    guard needsTopAnchorAfterRefresh else { return }
+    topAnchorGeneration += 1
+    let generation = topAnchorGeneration
+    let lockTop = { [weak self] in
+      guard let self, self.topAnchorGeneration == generation else { return }
+      let target = TiebaExploreRefreshAnchor.targetY(for: self.collectionView)
+      self.collectionView.setContentOffset(
+        CGPoint(x: self.collectionView.contentOffset.x, y: target),
+        animated: false
+      )
+    }
+    lockTop()
+    DispatchQueue.main.async { [weak self] in
+      guard let self, self.topAnchorGeneration == generation else { return }
+      self.collectionView.layoutIfNeeded()
+      lockTop()
+      DispatchQueue.main.async { [weak self] in
+        guard let self, self.topAnchorGeneration == generation else { return }
+        lockTop()
+        #if DEBUG
+        TiebaExploreRefreshAnchor.logIfClipped(context: "explore-hot.refresh", scrollView: self.collectionView)
+        #endif
+        self.cancelPendingTopAnchorRefresh()
+      }
+    }
+  }
+
+  // MARK: - 数据
+
+  @objc private func handleRefreshControl() {
+    TiebaSceneHaptics.fire("press")
+    needsTopAnchorAfterRefresh = true
+    reload()
+  }
+
+  /// 热榜 cell 字体/行高实时跟随 Dynamic Type；重载现有数据，不发网络请求。
+  func contentSizeDidChange() {
+    guard isViewLoaded else { return }
+    collectionView.collectionViewLayout.invalidateLayout()
+    collectionView.reloadData()
+  }
+
+  private func reload() {
+    requestSeq += 1
+    let seq = requestSeq
+    let tab = activeTab
+    let wasUserRefresh = refreshControl.isRefreshing
+    topAnchorGeneration += 1
+    needsTopAnchorAfterRefresh = wasUserRefresh
+    isReloading = threads.isEmpty == false
+    if threads.isEmpty { showState(.loading) }
+    collectionView.reloadData()
+    Task { @MainActor in
+      defer { refreshControl.endRefreshing() }
+      do {
+        let hot = try await TiebaFeedAPI.hotThreadList(tabCode: tab)
+        // 加载中点第二个分类：旧 tab 的响应一律丢弃。
+        guard seq == requestSeq, tab == activeTab else { return }
+        topics = hot.topics
+        tabs = hot.tabs
+        threads = hot.threads
+        // 内容已到：先复位重载态再刷新页头，spinner/半透明才不会永久停在页头。
+        isReloading = false
+        collectionView.reloadData()
+        if threads.isEmpty {
+          cancelPendingTopAnchorRefresh()
+          showState(.empty(
+            image: "flame",
+            text: "暂无热榜内容",
+            secondary: "稍后再来看看吧",
+            retryTitle: "刷新"
+          ), animated: true)
+        } else {
+          showList()
+        }
+        if wasUserRefresh { TiebaSceneHaptics.fire("action-success") }
+      } catch {
+        guard seq == requestSeq else { return }
+        isReloading = false
+        cancelPendingTopAnchorRefresh()
+        if threads.isEmpty {
+          showState(.error(message: error.localizedDescription, retryTitle: "刷新"), animated: true)
+        } else {
+          collectionView.reloadData()
+          showList()
+          pill.showResult(success: false, text: "加载失败")
+        }
+        if wasUserRefresh { TiebaSceneHaptics.fire("action-fail") }
+      }
+    }
+  }
+
+  private func selectTab(_ code: String) {
+    guard code != activeTab else { return }
+    TiebaSceneHaptics.fire("press")
+    activeTab = code
+    reload()
+  }
+
+  private func openTopic(_ topic: TiebaFeedAPI.Hot.Topic) {
+    TiebaSceneHaptics.fire("press")
+    TiebaNavigator.shared.navigate(.topic(id: topic.id, name: topic.name))
+  }
+
+  private func openThread(_ index: Int) {
+    guard threads.indices.contains(index) else { return }
+    let id = TiebaSimpleRowParser.string(threads[index].row["id"]) ?? ""
+    guard !id.isEmpty else { return }
+    TiebaSceneHaptics.fire("press")
+    TiebaNavigator.shared.navigate(.thread(id: id))
+  }
+
+  private func openForum(_ index: Int) {
+    guard threads.indices.contains(index) else { return }
+    let name = TiebaFeedRowFallback.resolve(threads[index].row).name
+    guard !name.isEmpty else { return }
+    TiebaSceneHaptics.fire("press")
+    TiebaNavigator.shared.navigate(.forum(name: name))
+  }
+
+  private func openAuthor(_ index: Int) {
+    guard threads.indices.contains(index) else { return }
+    let uid = TiebaSimpleRowParser.string(threads[index].row["authorId"]) ?? ""
+    guard !uid.isEmpty else { return }
+    TiebaSceneHaptics.fire("press")
+    TiebaNavigator.shared.navigate(.user(uid: uid))
+  }
+
+  // MARK: - 长按卡片菜单的四个动作（分享 / 复制内容 / 不感兴趣 / 屏蔽作者）
+
+  /// 帖子 id → 当前下标。菜单动作一律按 id 现查（期间可能已删行/换 tab）。
+  private func hotIndex(ofThread id: String) -> Int? {
+    guard !id.isEmpty else { return nil }
+    return threads.firstIndex { TiebaSimpleRowParser.string($0.row["id"]) == id }
+  }
+
+  private func openAuthor(ofThread id: String) {
+    guard let index = hotIndex(ofThread: id) else { return }
+    openAuthor(index)
+  }
+
+  private func openForum(ofThread id: String) {
+    guard let index = hotIndex(ofThread: id) else { return }
+    openForum(index)
+  }
+
+  /// 分享帖子：标题 + 帖子链接（与动态流/吧页同一条文案与同一分享面板）。
+  private func shareThread(_ id: String) {
+    guard let index = hotIndex(ofThread: id) else { return }
+    TiebaSceneHaptics.fire("press")
+    let url = "https://tieba.baidu.com/p/\(id)"
+    let title = TiebaSimpleRowParser.string(threads[index].row["title"]) ?? ""
+    TiebaShareSheet.present(text: title.isEmpty ? url : "\(title)\n\(url)", from: self)
+  }
+
+  /// 复制帖子内容：标题 + 正文纯文本（不含图片）。取段与拼接复用
+  /// TiebaFeedRowInteraction.postPlainText（动态流/吧页同一实现）。
+  private func copyPostContent(_ id: String) {
+    guard let index = hotIndex(ofThread: id) else { return }
+    let text = TiebaFeedRowInteraction.postPlainText(threads[index].row)
+    guard !text.isEmpty else { return }
+    TiebaClipboard.setString(text)
+    TiebaSceneHaptics.fire("action-success")
+    pill.showResult(success: true, text: "已复制帖子内容")
+  }
+
+  /// 不感兴趣：原因面板（与动态流/吧页同一个面板类）→ 上报 → 移除本行。
+  private func presentDislikeSheet(_ id: String) {
+    guard hotIndex(ofThread: id) != nil else { return }
+    TiebaSceneHaptics.fire("sheet-present")
+    let sheet = TiebaDislikeSheetViewController { [weak self] ids in
+      self?.submitDislike(id, ids: ids)
+    }
+    present(sheet, animated: true)
+  }
+
+  private func submitDislike(_ id: String, ids: String) {
+    guard let index = hotIndex(ofThread: id) else { return }
+    let forumId = TiebaSimpleRowParser.string(threads[index].row["forumId"]) ?? ""
+    Task { @MainActor in
+      do {
+        try await TiebaFeedAPI.submitDislike(threadId: id, dislikeIds: ids, forumId: forumId)
+        TiebaSceneHaptics.fire("action-success")
+        pill.showResult(success: true, text: "已减少此类内容推荐")
+        threads.removeAll { TiebaSimpleRowParser.string($0.row["id"]) == id }
+        applyThreadRemoval()
+      } catch {
+        TiebaSceneHaptics.fire("action-fail")
+        pill.showResult(success: false, text: "提交失败，请稍后重试")
+      }
+    }
+  }
+
+  /// 屏蔽作者：写本地屏蔽表（逐 uid 键，同吧页）→ 其所有行立即从本页移除。
+  private func blockAuthor(ofThread id: String) {
+    guard let index = hotIndex(ofThread: id) else { return }
+    let row = threads[index].row
+    let uid = TiebaSimpleRowParser.string(row["authorId"]) ?? ""
+    guard !uid.isEmpty else { return }
+    let name = TiebaSimpleRowParser.nonEmpty(row["authorNameShow"])
+      ?? TiebaSimpleRowParser.string(row["authorName"]) ?? ""
+    do {
+      try TiebaBlockStore.add(
+        user: TiebaBlockedUser(id: uid, uid: uid, username: name.isEmpty ? nil : name)
+      )
+    } catch {
+      TiebaSceneHaptics.fire("action-fail")
+      return
+    }
+    TiebaSceneHaptics.fire("action-success")
+    threads.removeAll { TiebaSimpleRowParser.string($0.row["authorId"]) == uid }
+    applyThreadRemoval()
+  }
+
+  /// 删行后的收尾：还有内容刷新列表（名次随之重排），空了给空状态。
+  private func applyThreadRemoval() {
+    if threads.isEmpty {
+      showState(.empty(
+        image: "flame",
+        text: "暂无热榜内容",
+        secondary: "稍后再来看看吧",
+        retryTitle: "刷新"
+      ), animated: true)
+    } else {
+      collectionView.reloadData()
+      showList()
+    }
+  }
+}
+
+// MARK: - 列表数据源
+
+extension TiebaHotListViewController: UICollectionViewDataSource, UICollectionViewDelegate {
+  /// 只更新两个标量并把值交给父页；不扫可见 cell、不碰布局。
+  func scrollViewDidScroll(_ scrollView: UIScrollView) {
+    chromeScrollOffsetY = scrollView.contentOffset.y
+    onChromeScrollChange?(scrollView.contentOffset.y)
+  }
+
+  /// 落点已贴顶时做 30pt 内的轻吸附；不改变分页/刷新事件。
+  func scrollViewWillEndDragging(
+    _ scrollView: UIScrollView,
+    withVelocity velocity: CGPoint,
+    targetContentOffset: UnsafeMutablePointer<CGPoint>
+  ) {
+    let top = -scrollView.adjustedContentInset.top
+    if targetContentOffset.pointee.y > top, targetContentOffset.pointee.y - top < 30 {
+      targetContentOffset.pointee.y = top
+    }
+  }
+
+  func collectionView(_ collectionView: UICollectionView, numberOfItemsInSection section: Int) -> Int {
+    threads.count
+  }
+
+  func collectionView(
+    _ collectionView: UICollectionView,
+    cellForItemAt indexPath: IndexPath
+  ) -> UICollectionViewCell {
+    let cell = collectionView.dequeueReusableCell(
+      withReuseIdentifier: TiebaHotListCell.reuseIdentifier,
+      for: indexPath
+    )
+    (cell as? TiebaHotListCell)?.configure(rank: indexPath.item + 1, thread: threads[indexPath.item])
+    return cell
+  }
+
+  func collectionView(
+    _ collectionView: UICollectionView,
+    viewForSupplementaryElementOfKind kind: String,
+    at indexPath: IndexPath
+  ) -> UICollectionReusableView {
+    if kind == UICollectionView.elementKindSectionHeader {
+      let header = collectionView.dequeueReusableSupplementaryView(
+        ofKind: kind,
+        withReuseIdentifier: TiebaHotHeaderView.reuseIdentifier,
+        for: indexPath
+      )
+      (header as? TiebaHotHeaderView)?.configure(
+        topics: topics,
+        tabs: tabs,
+        activeTab: activeTab,
+        tint: TiebaExploreSurface.brandFill,
+        isReloading: isReloading,
+        onTopic: { [weak self] topic in self?.openTopic(topic) },
+        onTab: { [weak self] code in self?.selectTab(code) }
+      )
+      return header
+    }
+    let footer = collectionView.dequeueReusableSupplementaryView(
+      ofKind: kind,
+      withReuseIdentifier: TiebaHotFooterView.reuseIdentifier,
+      for: indexPath
+    )
+    // 页脚只在有内容时出现（原 JS hotListFooter 的 threads.length > 0 判据）。
+    (footer as? TiebaHotFooterView)?.configure(visible: !threads.isEmpty)
+    return footer
+  }
+
+  func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
+    collectionView.deselectItem(at: indexPath, animated: false)
+    openThread(indexPath.item)
+  }
+
+  /// 热榜长按菜单：本页**已有**这套菜单（查看作者 / 进入吧），帖子长按需求落地时
+  /// 按「有就扩展、不挂第二套」原则在它后面追加四项（分享帖子 / 复制帖子内容 /
+  /// 不感兴趣 / 屏蔽作者）—— 全页仍然只有一个 UIContextMenuInteraction 入口。
+  func collectionView(
+    _ collectionView: UICollectionView,
+    contextMenuConfigurationForItemAt indexPath: IndexPath,
+    point: CGPoint
+  ) -> UIContextMenuConfiguration? {
+    guard threads.indices.contains(indexPath.item) else { return nil }
+    // 长按那一刻的帖子 id（不是下标）：菜单是异步的，动作触发时列表可能已经删行/
+    // 换 tab，下标会指到别人 —— 下面所有动作一律按 id 现查（hotIndex(ofThread:)）。
+    let threadId = TiebaSimpleRowParser.string(threads[indexPath.item].row["id"]) ?? ""
+    return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
+      guard let self, self.hotIndex(ofThread: threadId) != nil else { return nil }
+      let author = UIAction(title: "查看作者", image: UIImage(systemName: "person.crop.circle")) { _ in
+        self.openAuthor(ofThread: threadId)
+      }
+      let forum = UIAction(title: "进入吧", image: UIImage(systemName: "text.bubble")) { _ in
+        self.openForum(ofThread: threadId)
+      }
+      let share = UIAction(title: "分享帖子", image: UIImage(systemName: "square.and.arrow.up")) { _ in
+        self.shareThread(threadId)
+      }
+      let copy = UIAction(title: "复制帖子内容", image: UIImage(systemName: "doc.on.doc")) { _ in
+        self.copyPostContent(threadId)
+      }
+      let dislike = UIAction(title: "不感兴趣", image: UIImage(systemName: "hand.thumbsdown")) { _ in
+        self.presentDislikeSheet(threadId)
+      }
+      let block = UIAction(
+        title: "屏蔽作者",
+        image: UIImage(systemName: "person.crop.circle.badge.xmark")
+      ) { _ in
+        self.blockAuthor(ofThread: threadId)
+      }
+      return UIMenu(children: [author, forum, share, copy, dislike, block])
+    }
+  }
+}
+
+// MARK: - 行
+
+/// 热榜内容行（HotListContent.tsx renderHotItem 的 UIKit 直译）：
+/// 排名列（38pt 宽、22pt heavy 数字、前三名小色块）+ 正文列（paddingLeft 10）：
+/// 标题两行 → 作者行（18pt 圆头像 + 昵称 + 吧名 chip）→ 操作行（回复/赞 +
+/// 火焰热度）；全宽 systemBackground、padding 16、底部 hairline，高度自撑。
+final class TiebaHotListCell: UICollectionViewCell {
+  static let reuseIdentifier = "TiebaHotListCell"
+
+  /// 热榜前三名排名色（src/constants/rank.ts HOT_RANK_COLORS）。
+  static let topColors: [UIColor] = [
+    tiebaColor(from: "#FF3B30") ?? .systemRed,
+    tiebaColor(from: "#FF9500") ?? .systemOrange,
+    tiebaColor(from: "#FFCC00") ?? .systemYellow,
+  ]
+
+  private let cardView = UIView()
+  private let rowHairline = UIView()
+  private var rowHairlineHeight: NSLayoutConstraint?
+  private let rankBadge = UIView()
+  private let rankLabel = UILabel()
+  private let titleLabel = UILabel()
+  /// 18pt 作者头像：复用吧三页的 TiebaForumAvatarView（Nuke + 首字兜底、
+  /// 换图取消在途请求）。
+  private let avatarView = TiebaForumAvatarView(size: TiebaHotMetrics.avatarSize)
+  private let authorLabel = UILabel()
+  private let dotLabel = UILabel()
+  private let forumChip = UIView()
+  private let forumLabel = UILabel()
+  private let replyIcon = UIImageView()
+  private let replyLabel = UILabel()
+  private let agreeIcon = UIImageView()
+  private let agreeLabel = UILabel()
+  private let flameIcon = UIImageView()
+  private let hotLabel = UILabel()
+
+  private var rankColor: UIColor = TiebaExploreSurface.readableSecondary
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    isAccessibilityElement = true
+    accessibilityTraits = .button
+    let palette = TiebaHotMetrics.palette
+    let fonts = TiebaHotMetrics.fonts
+
+    cardView.backgroundColor = palette.card
+    cardView.layer.cornerRadius = 0
+    cardView.layer.borderWidth = 0
+    rowHairline.backgroundColor = palette.separator.withAlphaComponent(0.55)
+
+    rankBadge.layer.cornerRadius = 10
+    rankBadge.layer.cornerCurve = .continuous
+    rankLabel.font = fonts.rank
+    rankLabel.adjustsFontForContentSizeCategory = true
+    rankLabel.textAlignment = .center
+    rankLabel.adjustsFontSizeToFitWidth = true
+    rankLabel.minimumScaleFactor = 0.7
+    rankBadge.addSubview(rankLabel)
+
+    titleLabel.font = fonts.title
+
+    titleLabel.adjustsFontForContentSizeCategory = true
+    titleLabel.textColor = palette.text
+    titleLabel.numberOfLines = 2
+    titleLabel.lineBreakMode = .byTruncatingTail
+
+    authorLabel.font = fonts.author
+
+    authorLabel.adjustsFontForContentSizeCategory = true
+    authorLabel.textColor = palette.textSecondary
+    authorLabel.numberOfLines = 1
+    authorLabel.lineBreakMode = .byTruncatingTail
+    dotLabel.text = "·"
+    dotLabel.font = fonts.author
+    dotLabel.adjustsFontForContentSizeCategory = true
+    dotLabel.textColor = palette.textTertiary
+
+    forumChip.backgroundColor = palette.placeholder
+    forumChip.layer.cornerRadius = 8
+    forumChip.layer.cornerCurve = .continuous
+    forumLabel.font = fonts.forum
+    forumLabel.adjustsFontForContentSizeCategory = true
+    forumLabel.textColor = palette.textSecondary
+    forumLabel.numberOfLines = 1
+    forumLabel.lineBreakMode = .byTruncatingTail
+    forumChip.addSubview(forumLabel)
+
+    configureActionIcon(replyIcon, systemImage: "bubble.left")
+    configureActionIcon(agreeIcon, systemImage: "hand.thumbsup")
+    configureActionIcon(flameIcon, systemImage: "flame")
+    flameIcon.tintColor = palette.warning
+    replyLabel.font = fonts.action
+    replyLabel.adjustsFontForContentSizeCategory = true
+    agreeLabel.font = fonts.action
+    agreeLabel.adjustsFontForContentSizeCategory = true
+    replyLabel.textColor = palette.textTertiary
+    agreeLabel.textColor = palette.textTertiary
+    hotLabel.font = fonts.hot
+    hotLabel.adjustsFontForContentSizeCategory = true
+    hotLabel.textColor = palette.warning
+    replyIcon.tintColor = palette.textTertiary
+    agreeIcon.tintColor = palette.textTertiary
+
+    let metaRow = UIStackView(arrangedSubviews: [avatarView, authorLabel, dotLabel, forumChip])
+    metaRow.axis = .horizontal
+    metaRow.alignment = .center
+    metaRow.spacing = 6
+    let spacer = UIView()
+    spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    let actionRow = UIStackView(arrangedSubviews: [
+      replyIcon, replyLabel, agreeIcon, agreeLabel, spacer, flameIcon, hotLabel,
+    ])
+    actionRow.axis = .horizontal
+    actionRow.alignment = .center
+    actionRow.spacing = 5
+    // 计数与下一个图标 17pt（RN: row gap 5 + hotActionText.marginRight 12）、
+    // 火焰与热度值 8pt（gap 5 + hotHotNumWrap gap 3）。
+    actionRow.setCustomSpacing(17, after: replyLabel)
+    actionRow.setCustomSpacing(17, after: agreeLabel)
+    actionRow.setCustomSpacing(8, after: flameIcon)
+
+    let body = UIStackView(arrangedSubviews: [titleLabel, metaRow, actionRow])
+    body.axis = .vertical
+    body.alignment = .fill
+    body.spacing = 9 // 标题 / meta / 操作区三级留白
+
+    for view in [cardView, rowHairline, rankBadge, body, avatarView, forumChip] as [UIView] {
+      view.translatesAutoresizingMaskIntoConstraints = false
+    }
+    for view in [rankLabel, forumLabel] as [UIView] {
+      view.translatesAutoresizingMaskIntoConstraints = false
+    }
+    contentView.addSubview(cardView)
+    contentView.addSubview(rowHairline)
+    cardView.addSubview(rankBadge)
+    cardView.addSubview(body)
+    let hairlineHeight = rowHairline.heightAnchor.constraint(
+      equalToConstant: 1 / max(traitCollection.displayScale, 1)
+    )
+    rowHairlineHeight = hairlineHeight
+
+    NSLayoutConstraint.activate([
+      rowHairline.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: TiebaHotMetrics.hotCardPadding),
+      rowHairline.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -TiebaHotMetrics.hotCardPadding),
+      rowHairline.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+      hairlineHeight,
+      // 全宽内容行；内容左右留白由 body/rankBadge 的 16pt 承担。
+      cardView.leadingAnchor.constraint(
+        equalTo: contentView.leadingAnchor, constant: TiebaHotMetrics.hotCardMarginH),
+      cardView.trailingAnchor.constraint(
+        equalTo: contentView.trailingAnchor, constant: -TiebaHotMetrics.hotCardMarginH),
+      cardView.topAnchor.constraint(equalTo: contentView.topAnchor, constant: TiebaHotMetrics.hotCardMarginV),
+      cardView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -TiebaHotMetrics.hotCardMarginV),
+
+      // hotRankBadge：宽 38、顶部对齐（paddingTop 2）、圆角 10
+      rankBadge.leadingAnchor.constraint(
+        equalTo: cardView.leadingAnchor, constant: TiebaHotMetrics.hotCardPadding),
+      rankBadge.topAnchor.constraint(equalTo: cardView.topAnchor, constant: TiebaHotMetrics.hotCardPadding),
+      rankBadge.widthAnchor.constraint(equalToConstant: TiebaHotMetrics.rankColumnWidth),
+      rankLabel.topAnchor.constraint(equalTo: rankBadge.topAnchor, constant: 2),
+      rankLabel.leadingAnchor.constraint(equalTo: rankBadge.leadingAnchor),
+      rankLabel.trailingAnchor.constraint(equalTo: rankBadge.trailingAnchor),
+      rankLabel.bottomAnchor.constraint(equalTo: rankBadge.bottomAnchor),
+      rankBadge.bottomAnchor.constraint(
+        lessThanOrEqualTo: cardView.bottomAnchor, constant: -TiebaHotMetrics.hotCardPadding),
+
+      // hotCardBody：flex 1 + paddingLeft 10；卡片 padding 16
+      body.leadingAnchor.constraint(equalTo: rankBadge.trailingAnchor, constant: TiebaHotMetrics.bodyIndent),
+      body.trailingAnchor.constraint(
+        equalTo: cardView.trailingAnchor, constant: -TiebaHotMetrics.hotCardPadding),
+      body.topAnchor.constraint(equalTo: cardView.topAnchor, constant: TiebaHotMetrics.hotCardPadding),
+      body.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -TiebaHotMetrics.hotCardPadding),
+
+      // hotUserName 的 maxWidth: 80（超出截断，把空间让给吧名 chip）
+      authorLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 80),
+
+      // hotForumChip：paddingH 8 / paddingV 3
+      forumLabel.leadingAnchor.constraint(equalTo: forumChip.leadingAnchor, constant: 8),
+      forumLabel.trailingAnchor.constraint(equalTo: forumChip.trailingAnchor, constant: -8),
+      forumLabel.topAnchor.constraint(equalTo: forumChip.topAnchor, constant: 3),
+      forumLabel.bottomAnchor.constraint(equalTo: forumChip.bottomAnchor, constant: -3),
+      forumChip.widthAnchor.constraint(lessThanOrEqualToConstant: 140),
+
+      replyIcon.widthAnchor.constraint(equalToConstant: TiebaHotMetrics.iconSize),
+      replyIcon.heightAnchor.constraint(equalToConstant: TiebaHotMetrics.iconSize),
+      agreeIcon.widthAnchor.constraint(equalToConstant: TiebaHotMetrics.iconSize),
+      agreeIcon.heightAnchor.constraint(equalToConstant: TiebaHotMetrics.iconSize),
+      flameIcon.widthAnchor.constraint(equalToConstant: TiebaHotMetrics.iconSize),
+      flameIcon.heightAnchor.constraint(equalToConstant: TiebaHotMetrics.iconSize),
+    ])
+  }
+
+  required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+  override func prepareForReuse() {
+    super.prepareForReuse()
+    titleLabel.text = nil
+    authorLabel.text = nil
+    forumLabel.text = nil
+    isHighlighted = false
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    rowHairlineHeight?.constant = 1 / max(traitCollection.displayScale, 1)
+    rowHairline.backgroundColor = TiebaHotMetrics.palette.separator.withAlphaComponent(0.55)
+  }
+
+  func configure(rank: Int, thread: TiebaFeedAPI.Hot.Thread) {
+    let palette = TiebaHotMetrics.palette
+    titleLabel.numberOfLines = traitCollection.preferredContentSizeCategory.isAccessibilityCategory ? 0 : 2
+    cardView.backgroundColor = palette.card
+    cardView.layer.cornerRadius = 0
+    cardView.layer.borderWidth = 0
+    rowHairline.backgroundColor = palette.separator.withAlphaComponent(0.55)
+    let row = thread.row
+    rankColor = rank <= 3 ? Self.topColors[rank - 1] : palette.textTertiary
+    rankLabel.text = "\(rank)"
+    // 22pt heavy 排名数字也要 ≥3:1；前三名保留红/橙语义但换更深可读档。
+    rankLabel.textColor = rank <= 1
+      ? palette.liked
+      : (rank <= 3 ? palette.warning : palette.textTertiary)
+    rankBadge.backgroundColor = rank <= 3 ? rankColor.withAlphaComponent(0.08) : .clear
+
+    titleLabel.text = TiebaSimpleRowParser.string(row["title"]) ?? ""
+    let author = TiebaSimpleRowParser.string(row["authorNameShow"])
+      ?? TiebaSimpleRowParser.string(row["authorName"]) ?? ""
+    authorLabel.text = author.isEmpty ? "吧友" : author
+    avatarView.configure(
+      url: TiebaSimpleRowParser.avatarURL(TiebaSimpleRowParser.string(row["authorPortrait"]) ?? "")?
+        .absoluteString ?? "",
+      initial: author.isEmpty ? "吧" : author
+    )
+    // 吧名/吧头像兜底（同一份 TiebaFeedRowFallback：服务端热榜行同样可能缺名/缺图）。
+    let forum = TiebaFeedRowFallback.resolve(row)
+    forumLabel.text = forum.name
+    forumChip.isHidden = forum.name.isEmpty
+    forumChip.backgroundColor = palette.placeholder
+
+    replyLabel.text = TiebaForumFormat.count(Int(TiebaSimpleRowParser.double(row["replyNum"]) ?? 0))
+    agreeLabel.text = TiebaForumFormat.count(Int(thread.agreeNum))
+    hotLabel.text = TiebaForumFormat.count(Int(thread.hotNum))
+    hotLabel.textColor = palette.warning
+    flameIcon.tintColor = palette.warning
+
+    accessibilityLabel = [
+      "第\(rank)名", titleLabel.text ?? "", authorLabel.text ?? "",
+      forum.name.isEmpty ? "" : "\(forum.name)吧",
+      "回复\(replyLabel.text ?? "")", "赞\(agreeLabel.text ?? "")",
+      "热度\(hotLabel.text ?? "")",
+    ].filter { !$0.isEmpty }.joined(separator: "，")
+  }
+
+  /// 按压态（JS pressed：opacity 0.9 + scale 0.98）。
+  override var isHighlighted: Bool {
+    didSet {
+      let apply = {
+        self.cardView.alpha = self.isHighlighted ? 0.86 : 1
+        self.cardView.transform = self.isHighlighted
+          ? CGAffineTransform(scaleX: 0.98, y: 0.98)
+          : .identity
+      }
+      guard UIAccessibility.isReduceMotionEnabled == false else {
+        apply()
+        return
+      }
+      TiebaAnimation.animate(
+        curve: .easeOut,
+        duration: TiebaAnimationDuration.microFeedback,
+        options: [.beginFromCurrentState, .allowUserInteraction],
+        animations: apply
+      )
+    }
+  }
+
+  override func preferredLayoutAttributesFitting(
+    _ layoutAttributes: UICollectionViewLayoutAttributes
+  ) -> UICollectionViewLayoutAttributes {
+    let width = layoutAttributes.size.width
+    let size = contentView.systemLayoutSizeFitting(
+      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel
+    )
+    layoutAttributes.size = CGSize(width: width, height: ceil(size.height))
+    return layoutAttributes
+  }
+
+  private func configureActionIcon(_ imageView: UIImageView, systemImage: String) {
+    imageView.image = UIImage(
+      systemName: systemImage,
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: TiebaHotMetrics.iconSize, weight: .regular)
+    )
+    imageView.contentMode = .scaleAspectFit
+  }
+}
+
+/// 热榜行/页头共用的几何与字号（对齐 HotListContent.tsx 的字号档与 18pt 头像）。
+private enum TiebaHotMetrics {
+  static let cardRadius: CGFloat = TiebaExploreSurface.cardRadius
+  static let avatarSize: CGFloat = 18
+  static let iconSize: CGFloat = 13
+  static let hotCardMarginH: CGFloat = 0
+  static let hotCardMarginV: CGFloat = 0
+  static let hotCardPadding: CGFloat = 16
+  static let rankColumnWidth: CGFloat = 38
+  static let bodyIndent: CGFloat = 10
+
+  /// 计算属性（不是 static let）：static let 会在进程内首次访问时把六个字号档解析死，
+  /// 之后改 Dynamic Type 新建的 cell 仍拿旧档字体。
+  static var fonts: Fonts { Fonts() }
+
+  /// 与动态流同源的纯 systemBackground 内容面（chrome 玻璃不进入列表）。
+  static var palette: TiebaFeedRowPalette {
+    TiebaExploreSurface.palette()
+  }
+
+  /// 字号 = **界面级**（界面字号 × 系统 Dynamic Type）。style 参数保留在签名上
+  /// 只为不动 6 个调用点的实参顺序；缩放统一走 TiebaSimpleText（全仓唯一换算）。
+  static func font(_ size: CGFloat, _ weight: UIFont.Weight, _ style: UIFont.TextStyle) -> UIFont {
+    _ = style
+    return TiebaSimpleText.font(size: size, weight: weight)
+  }
+
+  struct Fonts {
+    let rank = TiebaHotMetrics.font(22, .heavy, .title2)
+    let title = TiebaHotMetrics.font(17, .semibold, .headline)
+    let author = TiebaHotMetrics.font(12.5, .medium, .footnote)
+    let forum = TiebaHotMetrics.font(11.5, .medium, .caption1)
+    let action = TiebaHotMetrics.font(12, .regular, .footnote)
+    let hot = TiebaHotMetrics.font(12.5, .bold, .footnote)
+  }
+}
+
+
+// MARK: - 页头（热门话题 + 分类）
+
+/// 热榜页头（HotListContent.tsx 的 ListHeader：重载行 → 热门话题 →
+/// 分类 Tab → 「排名按热度计算」提示）。JS 侧横向滚动区各自带 14pt 内白与
+/// 16pt 标题内白，这里逐项复刻；容器自撑高度（preferredLayoutAttributesFitting）。
+final class TiebaHotHeaderView: UICollectionReusableView {
+  static let reuseIdentifier = "TiebaHotHeaderView"
+
+  private let spinnerRow = UIView()
+  private let spinner = UIActivityIndicatorView(style: .medium)
+  private let contentStack = UIStackView()
+  private let topicsContainer = UIView()
+  private let topicsHeader = UIStackView()
+  private let topicsTitle = UILabel()
+  private let topicScroll = UIScrollView()
+  private let topicRow = UIStackView()
+  private let tabsContainer = UIView()
+  private let tabScroll = UIScrollView()
+  private let tabRow = UIStackView()
+  private let tipContainer = UIView()
+  private let tipLabel = UILabel()
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    let palette = TiebaHotMetrics.palette
+
+    spinner.hidesWhenStopped = true
+    spinner.color = palette.primary
+
+    let flame = UIImageView(image: UIImage(
+      systemName: "flame.fill",
+      withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .regular)
+    ))
+    flame.tintColor = .systemRed
+    flame.contentMode = .scaleAspectFit
+    topicsTitle.text = "热门话题"
+    topicsTitle.font = TiebaHotMetrics.font(20, .semibold, .title2)
+    topicsTitle.adjustsFontForContentSizeCategory = true
+    topicsTitle.textColor = palette.text
+    topicsHeader.axis = .horizontal
+    topicsHeader.spacing = 6
+    topicsHeader.alignment = .center
+    topicsHeader.addArrangedSubview(flame)
+    topicsHeader.addArrangedSubview(topicsTitle)
+
+    configureScroll(topicScroll, row: topicRow, spacing: 10, horizontalInset: 14, height: 40)
+    configureScroll(tabScroll, row: tabRow, spacing: 8, horizontalInset: 14, height: 36)
+
+    tipLabel.text = "排名按热度计算 · 实时更新"
+    tipLabel.font = TiebaHotMetrics.font(12, .regular, .caption1)
+    tipLabel.adjustsFontForContentSizeCategory = true
+    tipLabel.textColor = palette.textTertiary
+
+    spinnerRow.addSubview(spinner)
+    topicsContainer.addSubview(topicsHeader)
+    topicsContainer.addSubview(topicScroll)
+    tabsContainer.addSubview(tabScroll)
+    tipContainer.addSubview(tipLabel)
+    contentStack.axis = .vertical
+    contentStack.spacing = 0
+    contentStack.alignment = .fill
+    for view in [spinnerRow, topicsContainer, tabsContainer, tipContainer] as [UIView] {
+      contentStack.addArrangedSubview(view)
+    }
+    for view in [
+      contentStack, spinnerRow, topicsContainer, tabsContainer, tipContainer,
+      spinner, topicsHeader, tipLabel,
+    ] as [UIView] {
+      view.translatesAutoresizingMaskIntoConstraints = false
+    }
+    addSubview(contentStack)
+
+    NSLayoutConstraint.activate([
+      contentStack.leadingAnchor.constraint(equalTo: leadingAnchor),
+      contentStack.trailingAnchor.constraint(equalTo: trailingAnchor),
+      contentStack.topAnchor.constraint(equalTo: topAnchor),
+      contentStack.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+      // 重载行：paddingVertical 12 的居中 spinner（stale-while-revalidate）。
+      spinner.centerXAnchor.constraint(equalTo: spinnerRow.centerXAnchor),
+      spinner.topAnchor.constraint(equalTo: spinnerRow.topAnchor, constant: 12),
+      spinner.bottomAnchor.constraint(equalTo: spinnerRow.bottomAnchor, constant: -12),
+
+      // 热门话题：section paddingTop 16 / paddingBottom 6；标题行 paddingH 16、
+      // 与话题滚动区间距 12；滚动区 paddingH 14。
+      topicsHeader.leadingAnchor.constraint(equalTo: topicsContainer.leadingAnchor, constant: 16),
+      topicsHeader.trailingAnchor.constraint(lessThanOrEqualTo: topicsContainer.trailingAnchor, constant: -16),
+      topicsHeader.topAnchor.constraint(equalTo: topicsContainer.topAnchor, constant: 16),
+      topicScroll.leadingAnchor.constraint(equalTo: topicsContainer.leadingAnchor),
+      topicScroll.trailingAnchor.constraint(equalTo: topicsContainer.trailingAnchor),
+      topicScroll.topAnchor.constraint(equalTo: topicsHeader.bottomAnchor, constant: 12),
+      topicScroll.bottomAnchor.constraint(equalTo: topicsContainer.bottomAnchor, constant: -6),
+
+      // 分类 Tab：paddingTop 14 / paddingBottom 8 / paddingH 14。
+      tabScroll.leadingAnchor.constraint(equalTo: tabsContainer.leadingAnchor),
+      tabScroll.trailingAnchor.constraint(equalTo: tabsContainer.trailingAnchor),
+      tabScroll.topAnchor.constraint(equalTo: tabsContainer.topAnchor, constant: 14),
+      tabScroll.bottomAnchor.constraint(equalTo: tabsContainer.bottomAnchor, constant: -8),
+
+      // rankTip：paddingH 16 / paddingTop 10 / paddingBottom 8。
+      tipLabel.leadingAnchor.constraint(equalTo: tipContainer.leadingAnchor, constant: 16),
+      tipLabel.trailingAnchor.constraint(lessThanOrEqualTo: tipContainer.trailingAnchor, constant: -16),
+      tipLabel.topAnchor.constraint(equalTo: tipContainer.topAnchor, constant: 10),
+      tipLabel.bottomAnchor.constraint(equalTo: tipContainer.bottomAnchor, constant: -8),
+    ])
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  func configure(
+    topics: [TiebaFeedAPI.Hot.Topic],
+    tabs: [TiebaFeedAPI.Hot.Tab],
+    activeTab: String,
+    tint: UIColor,
+    isReloading: Bool,
+    onTopic: @escaping (TiebaFeedAPI.Hot.Topic) -> Void,
+    onTab: @escaping (String) -> Void
+  ) {
+    spinnerRow.isHidden = !isReloading
+    if isReloading { spinner.startAnimating() } else { spinner.stopAnimating() }
+    // stale-while-revalidate：换 tab 期间旧内容半透明（JS 的 opacity 0.5）。
+    for container in [topicsContainer, tabsContainer, tipContainer] {
+      container.alpha = isReloading ? 0.5 : 1
+    }
+
+    clear(topicRow)
+    topicsContainer.isHidden = topics.isEmpty
+    for (index, topic) in topics.prefix(8).enumerated() {
+      let chip = TiebaHotTopicChip(index: index, title: topic.name)
+      chip.onTap = { onTopic(topic) }
+      topicRow.addArrangedSubview(chip)
+    }
+
+    clear(tabRow)
+    tabsContainer.isHidden = tabs.isEmpty
+    if !tabs.isEmpty {
+      let all = TiebaHotTabChip(title: "全部", tint: tint)
+      all.isSelected = activeTab == "all"
+      all.onTap = { onTab("all") }
+      tabRow.addArrangedSubview(all)
+      // 分类只展示前 6 个（与旧页 slice(0, 6) 同）。
+      for tab in tabs.prefix(6) {
+        let chip = TiebaHotTabChip(title: tab.name, tint: tint)
+        chip.isSelected = activeTab == tab.code
+        chip.onTap = { onTab(tab.code) }
+        tabRow.addArrangedSubview(chip)
+      }
+    }
+  }
+
+  /// 横向滚动区：内容行贴 contentLayoutGuide，左右内白 + 固定行高 + 间距。
+  private func configureScroll(
+    _ scroll: UIScrollView,
+    row: UIStackView,
+    spacing: CGFloat,
+    horizontalInset: CGFloat,
+    height: CGFloat
+  ) {
+    scroll.translatesAutoresizingMaskIntoConstraints = false
+    row.translatesAutoresizingMaskIntoConstraints = false
+    scroll.showsHorizontalScrollIndicator = false
+    scroll.alwaysBounceHorizontal = true
+    row.axis = .horizontal
+    row.spacing = spacing
+    row.alignment = .fill
+    scroll.addSubview(row)
+    NSLayoutConstraint.activate([
+      scroll.heightAnchor.constraint(equalToConstant: height),
+      row.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: horizontalInset),
+      row.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -horizontalInset),
+      row.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+      row.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+      row.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
+    ])
+  }
+
+  private func clear(_ stack: UIStackView) {
+    for view in stack.arrangedSubviews {
+      stack.removeArrangedSubview(view)
+      view.removeFromSuperview()
+    }
+  }
+
+  override func preferredLayoutAttributesFitting(
+    _ layoutAttributes: UICollectionViewLayoutAttributes
+  ) -> UICollectionViewLayoutAttributes {
+    let width = layoutAttributes.size.width
+    let size = systemLayoutSizeFitting(
+      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel
+    )
+    layoutAttributes.size = CGSize(width: width, height: ceil(size.height))
+    return layoutAttributes
+  }
+}
+
+/// 热门话题 chip（HotListContent.tsx topicChip）：胶囊 + 20pt 排名圆标 + 8 色轮换
+/// （src/constants/rank.ts TOPIC_CHIP_COLORS，bg 12%、border 30%）。圆角/描边/按压
+/// 态交给 UIButton.Configuration（不再手写 UIControl + layoutSubviews 解析描边色）。
+final class TiebaHotTopicChip: UIButton {
+  var onTap: (() -> Void)?
+
+  init(index: Int, title: String) {
+    let colors = TiebaHotTopicChip.palette[index % TiebaHotTopicChip.palette.count]
+    super.init(frame: .zero)
+    var config = UIButton.Configuration.plain()
+    config.image = Self.badgeImage(index: index, color: colors.rank)
+    config.title = title
+    config.imagePadding = 8   // rank badge 与文字 gap 8
+    config.cornerStyle = .capsule
+    config.titleLineBreakMode = .byTruncatingTail
+    config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+      var out = incoming
+      out.font = TiebaHotMetrics.font(14, .semibold, .subheadline)
+      return out
+    }
+    // paddingH 14 / paddingV 10（badge 20 + 上下各 10 = 40 高）。
+    config.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 14, bottom: 10, trailing: 14)
+    config.background.backgroundColor = colors.background
+    config.background.strokeColor = colors.border
+    config.background.strokeWidth = 1
+    config.baseForegroundColor = TiebaHotMetrics.palette.text
+    configuration = config
+    configurationUpdateHandler = { button in
+      // JS pressed：opacity 0.8 + scale 0.95。
+      button.alpha = button.isHighlighted ? 0.8 : 1
+      button.transform = button.isHighlighted ? CGAffineTransform(scaleX: 0.95, y: 0.95) : .identity
+    }
+    // 标题区 maxWidth 130（原 titleLabel ≤ 130）+ badge 20 + gap 8 + padding 28。
+    setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    widthAnchor.constraint(lessThanOrEqualToConstant: 186).isActive = true
+    addAction(UIAction { [weak self] _ in self?.onTap?() }, for: .touchUpInside)
+    accessibilityLabel = "第\(index + 1)名 \(title)"
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  /// 20pt 排名圆标：数字 + 圆底合成一张图，按钮里不再塞子视图。
+  private static func badgeImage(index: Int, color: UIColor) -> UIImage {
+    let size = CGSize(width: 20, height: 20)
+    let image = UIGraphicsImageRenderer(size: size).image { context in
+      color.setFill()
+      context.cgContext.fillEllipse(in: CGRect(origin: .zero, size: size))
+      let text = "\(index + 1)" as NSString
+      let attributes: [NSAttributedString.Key: Any] = [
+        .font: TiebaHotMetrics.font(11, .heavy, .caption2),
+        .foregroundColor: UIColor.white,
+      ]
+      let textSize = text.size(withAttributes: attributes)
+      text.draw(
+        at: CGPoint(x: (size.width - textSize.width) / 2, y: (size.height - textSize.height) / 2),
+        withAttributes: attributes
+      )
+    }
+    return image.withRenderingMode(.alwaysOriginal)
+  }
+
+  private static let palette: [(background: UIColor, rank: UIColor, border: UIColor)] = [
+    ("#FF3B3012", "#FF3B30", "#FF3B3030"),
+    ("#FF950012", "#FF9500", "#FF950030"),
+    ("#FFCC0012", "#CC9900", "#FFCC0030"),
+    ("#34C75912", "#34C759", "#34C75930"),
+    ("#5AC8FA12", "#5AC8FA", "#5AC8FA30"),
+    ("#007AFF12", "#007AFF", "#007AFF30"),
+    ("#5856D612", "#5856D6", "#5856D630"),
+    ("#AF52DE12", "#AF52DE", "#AF52DE30"),
+  ].map { entry in
+    (
+      tiebaColor(from: entry.0) ?? .clear,
+      tiebaColor(from: entry.1) ?? .clear,
+      tiebaColor(from: entry.2) ?? .clear
+    )
+  }
+}
+
+/// 分类 Tab chip（HotListContent.tsx tabItem）：paddingH 18 / paddingV 9 / 胶囊；
+/// 选中 = primary 底 + 白字，未选中 = surfaceSecondary 底 + 次要字（isSelected 驱动
+/// configurationUpdateHandler，选中/按压态不再手写 backgroundColor）。
+final class TiebaHotTabChip: UIButton {
+  private let tint: UIColor
+  var onTap: (() -> Void)?
+
+  init(title: String, tint: UIColor) {
+    self.tint = tint
+    super.init(frame: .zero)
+    var config = UIButton.Configuration.plain()
+    config.title = title
+    config.cornerStyle = .capsule
+    config.titleLineBreakMode = .byTruncatingTail
+    config.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { incoming in
+      var out = incoming
+      out.font = TiebaHotMetrics.font(14, .semibold, .subheadline)
+      return out
+    }
+    config.contentInsets = NSDirectionalEdgeInsets(top: 9, leading: 18, bottom: 9, trailing: 18)
+    configuration = config
+    configurationUpdateHandler = { [weak self] button in
+      guard let self else { return }
+      let palette = TiebaHotMetrics.palette
+      var config = button.configuration
+      config?.background.backgroundColor = button.isSelected ? self.tint : palette.placeholder
+      config?.baseForegroundColor = button.isSelected ? .white : palette.textSecondary
+      button.configuration = config
+      button.accessibilityValue = button.isSelected ? "已选中" : nil
+      // JS pressed：opacity 0.8 + scale 0.95。
+      button.alpha = button.isHighlighted ? 0.8 : 1
+      button.transform = button.isHighlighted ? CGAffineTransform(scaleX: 0.95, y: 0.95) : .identity
+    }
+    setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+    addAction(UIAction { [weak self] _ in self?.onTap?() }, for: .touchUpInside)
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+// MARK: - 页脚
+
+/// 「到底卡」（HotListContent.tsx hotFooter）：内容全展示后压在列表底部，
+/// 130pt 高、radius.card；无内容时整块收起（JS 的 hotListFooter 返回 null）。
+final class TiebaHotFooterView: UICollectionReusableView {
+  static let reuseIdentifier = "TiebaHotFooterView"
+
+  private let card = UIView()
+  private let titleLabel = UILabel()
+  private let hintLabel = UILabel()
+  private var cardHeight: NSLayoutConstraint!
+  private var topInset: NSLayoutConstraint!
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    // 与热榜卡片同一份色板（深色/自定义主题下不再两套底色）。
+    let palette = TiebaHotMetrics.palette
+    card.backgroundColor = palette.card
+    card.layer.cornerRadius = TiebaHotMetrics.cardRadius
+    card.layer.cornerCurve = .continuous
+    card.layer.borderWidth = 0
+    card.layer.borderColor = UIColor.clear.cgColor
+    titleLabel.text = "— 已展示全部热榜内容 —"
+    titleLabel.font = TiebaHotMetrics.font(13, .semibold, .footnote)
+    titleLabel.adjustsFontForContentSizeCategory = true
+    titleLabel.textColor = palette.textTertiary
+    hintLabel.text = "下拉刷新看看有没有新内容"
+    hintLabel.font = TiebaHotMetrics.font(12, .regular, .caption1)
+    hintLabel.adjustsFontForContentSizeCategory = true
+    hintLabel.textColor = palette.textTertiary
+    let stack = UIStackView(arrangedSubviews: [titleLabel, hintLabel])
+    stack.axis = .vertical
+    stack.alignment = .center
+    stack.spacing = 6
+    for view in [card, stack] as [UIView] {
+      view.translatesAutoresizingMaskIntoConstraints = false
+    }
+    addSubview(card)
+    card.addSubview(stack)
+    cardHeight = card.heightAnchor.constraint(equalToConstant: 130)
+    topInset = card.topAnchor.constraint(equalTo: topAnchor, constant: 16)
+    NSLayoutConstraint.activate([
+      card.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+      card.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+      topInset,
+      card.bottomAnchor.constraint(equalTo: bottomAnchor),
+      cardHeight,
+      stack.centerXAnchor.constraint(equalTo: card.centerXAnchor),
+      stack.centerYAnchor.constraint(equalTo: card.centerYAnchor),
+    ])
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  func configure(visible: Bool) {
+    card.isHidden = !visible
+    cardHeight.constant = visible ? 130 : 0
+    topInset.constant = visible ? 16 : 0
+  }
+
+  override func preferredLayoutAttributesFitting(
+    _ layoutAttributes: UICollectionViewLayoutAttributes
+  ) -> UICollectionViewLayoutAttributes {
+    let width = layoutAttributes.size.width
+    let size = systemLayoutSizeFitting(
+      CGSize(width: width, height: UIView.layoutFittingCompressedSize.height),
+      withHorizontalFittingPriority: .required,
+      verticalFittingPriority: .fittingSizeLevel
+    )
+    layoutAttributes.size = CGSize(width: width, height: ceil(size.height))
+    return layoutAttributes
+  }
+}

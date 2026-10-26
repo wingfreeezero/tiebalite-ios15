@@ -1,0 +1,257 @@
+// 已知主贴区（原 thread/[id].tsx 的 KnownPostHeader）：帖子首包返回前显示列表里
+// 已知的标题/作者/摘要/首图，首包落地后整块（含骨架）一起被真实主贴卡替换。
+// 几何逐项对齐 JS 的 knownCard/knownTitle/knownAuthorRow/knownAbstract/knownImage。
+import UIKit
+import NukeExtensions
+
+final class TiebaThreadKnownPostView: UIView {
+  private let card = UIView()
+  private let titleLabel = UILabel()
+  private let authorLabel = UILabel()
+  private let abstractLabel = UILabel()
+  private let imageView = TiebaKnownPostImageView()
+
+  private let snapshot: TiebaThreadSnapshot
+  private var palette: TiebaFeedRowPalette = .default
+
+  /// 图片按固定宽高比铺满卡片内容宽（JS: height = clamp(w × h/w, 1, 320)）。
+  private var imageAspect: CGFloat {
+    snapshot.imageWidth > 0 && snapshot.imageHeight > 0
+      ? CGFloat(snapshot.imageWidth / snapshot.imageHeight) : 0
+  }
+
+  /// 竖长图（与 TiebaThreadImage.isTall / MediaPager LONG_IMAGE_RATIO 同值）。
+  private var isTallImage: Bool {
+    snapshot.imageWidth > 0 && snapshot.imageHeight > 0
+      && CGFloat(snapshot.imageHeight / snapshot.imageWidth) > 2.4
+  }
+
+  /// 图片高度与真实主贴卡同一套规则（见 TiebaPostRowLayout.longImageHeight / singleImageMaxHeight）：竖长图
+  /// 固定 300，其余按宽高比、上限 520。两边算不一样时，换卡那一刻图片与它下面的
+  /// 内容会整体跳一次——用户报的"加载完突然往上瞬移"就有这一份。
+  private func imageHeight(forWidth width: CGFloat) -> CGFloat {
+    if isTallImage { return TiebaPostRowLayout.longImageHeight }
+    return min(
+      max(width / max(imageAspect, 0.01), 1),
+      TiebaPostRowLayout.singleImageMaxHeight
+    )
+  }
+  private var imageViewWidth: CGFloat = 0
+
+  init(snapshot: TiebaThreadSnapshot) {
+    self.snapshot = snapshot
+    super.init(frame: .zero)
+    isAccessibilityElement = false
+    build()
+  }
+
+  @available(*, unavailable)
+  required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    card.layer.shadowPath = UIBezierPath(
+      roundedRect: card.bounds,
+      cornerRadius: card.layer.cornerRadius
+    ).cgPath
+  }
+
+  func applyPalette(_ palette: TiebaFeedRowPalette) {
+    self.palette = palette
+    card.backgroundColor = TiebaAccessibleColors.elevatedSurface
+    let dark = palette.isNight || traitCollection.userInterfaceStyle == .dark
+    card.layer.cornerRadius = TiebaAccessibleColors.surfaceRadius
+    card.layer.borderWidth = 0
+    card.layer.borderColor = UIColor.clear.cgColor
+    card.layer.shadowColor = UIColor.black.cgColor
+    card.layer.shadowOpacity = dark ? 0.10 : 0.08
+    titleLabel.textColor = palette.text
+    authorLabel.textColor = TiebaAccessibleColors.metadata
+    abstractLabel.textColor = TiebaAccessibleColors.metadata
+    imageView.backgroundColor = palette.placeholder
+  }
+
+  // MARK: - 装配
+
+  private func build() {
+    // 进帖转场的目标端配对：占位卡是首帧就存在的那张卡，Hero 让它从被点的
+    // 信息流卡片位置放大过来（id 与源端同源，见 TiebaHeroTransition）。
+    TiebaHeroTransition.mark(card, threadId: snapshot.id)
+    // 首图单独配对（与卡片嵌套：Hero 取快照前会把两者都置 alpha 0，不会双影）。
+    // 无图时 snapshot.imageURL 为 nil，此时不配对，图片飞行自然缺席。
+    if snapshot.imageURL != nil {
+      TiebaHeroTransition.markImage(imageView, threadId: snapshot.id)
+    }
+    // 与真实 Hero 同一套几何：帖子页内部固定扁平（TiebaPostRowPlan 的
+    // `isCardAppearance = false`）—— 通栏、无圆角、无描边、无投影，内容左 16。
+    // 以前这里按「卡片」做（12pt 外距 + 24pt 圆角 + 投影），首包落地换成扁平 Hero 时
+    // 整块会横向撑开、圆角消失、投影消失 —— 用户说的"卡片突然变扁平"就是这一步。
+    card.layer.cornerRadius = 0
+    card.layer.cornerCurve = .continuous
+    card.layer.borderWidth = 0
+    card.layer.shadowOpacity = 0
+    card.translatesAutoresizingMaskIntoConstraints = false
+    addSubview(card)
+
+    let stack = UIStackView()
+    stack.axis = .vertical
+    stack.alignment = .fill
+    stack.spacing = 18 // 与真实 Hero 的 title/author/body 呼吸一致
+    stack.isLayoutMarginsRelativeArrangement = true
+    stack.directionalLayoutMargins = NSDirectionalEdgeInsets(
+      top: 16,
+      leading: 16,
+      bottom: 18,
+      trailing: 16
+    )
+    // 占位卡挂在全屏列表顶部，顶部留白由 contentInset.top 承担，不让栈再吃
+    // 安全区边距（否则测量/布局两趟差一份安全区高，卡片会被撑开一片空白）。
+    stack.insetsLayoutMarginsFromSafeArea = false
+    stack.translatesAutoresizingMaskIntoConstraints = false
+    card.addSubview(stack)
+
+    // 标题：占位卡的第一个块（JS knownTitle 17pt/22pt/最多 3 行）。快照里标题一直
+    // 有，漏掉它占位卡就没有帖名——与作者行、摘要同尺排下去，换真卡不位移。
+    if !snapshot.title.isEmpty {
+      // 字号/行高与真实主贴卡同源（TiebaPostRowLayout.titleFont/titleLineHeight）：
+      // 这两个都只读独立的 titleScale（默认 22pt/28pt），与正文/界面字号互不影响。
+      // 同一次取出来再传给 label 与 attributedText，避免两次快照读取之间错过变更。
+      let titleFont = TiebaPostRowLayout.titleFont
+      let titleLineHeight = max(TiebaPostRowLayout.titleLineHeight, ceil(titleFont.lineHeight))
+      titleLabel.font = titleFont
+      // 与真卡（TiebaPostRowLayout.titleLineLimit = 0）保持一致：都不截断，
+      // 否则换卡那一刻标题行数会变、下面整块跳一次。
+      // makeAttributed 的 truncating 默认 true，会以 byTruncatingTail 盖过 numberOfLines=0
+      // ——标题完整却渲染出真卡没有的省略号，故显式按真卡口径传。
+      titleLabel.numberOfLines = TiebaPostRowLayout.titleLineLimit
+      titleLabel.attributedText = TiebaSimpleText.makeAttributed(
+        text: snapshot.title,
+        font: titleFont,
+        lineHeight: titleLineHeight,
+        truncating: TiebaPostRowLayout.titleLineLimit > 0
+      )
+      stack.addArrangedSubview(titleLabel)
+    }
+
+    // 作者行：与真实主贴卡同尺（头像 40 / 昵称 16 semibold）——换卡时不位移。
+    let row = UIStackView()
+    row.axis = .horizontal
+    row.alignment = .center
+    row.spacing = 10
+    let avatar = TiebaForumAvatarView(size: 40)
+    avatar.configure(url: snapshot.authorPortrait, initial: snapshot.authorName)
+    row.addArrangedSubview(avatar)
+    authorLabel.text = snapshot.authorName
+    authorLabel.font = TiebaPostRowLayout.nameFontMain
+    let ax = TiebaPostRowLayout.nameFont.pointSize >= 20
+    authorLabel.numberOfLines = ax ? 0 : 2
+    authorLabel.lineBreakMode = ax ? .byWordWrapping : .byTruncatingTail
+    row.addArrangedSubview(authorLabel)
+    stack.addArrangedSubview(row)
+
+    if !snapshot.abstract.isEmpty {
+      abstractLabel.text = snapshot.abstract
+      // 字号/行高与真实主贴正文同尺（15pt/22pt，见 TiebaPostRowMetrics.buildContent）：
+      // 摘要本来就是正文的预览，行高不一致时换卡会整块上下跳（用户 2026-09-15 报）。
+      // 颜色留次要色——预览的视觉设计不变。
+      abstractLabel.font = TiebaSimpleText.bodyFont(size: 17, weight: .regular)
+      abstractLabel.numberOfLines = TiebaPostRowLayout.nameFont.pointSize >= 20 ? 0 : 2
+      abstractLabel.lineBreakMode = abstractLabel.numberOfLines == 0
+        ? .byWordWrapping
+        : .byTruncatingTail
+      abstractLabel.attributedText = TiebaSimpleText.makeAttributed(
+        text: snapshot.abstract,
+        font: TiebaSimpleText.bodyFont(size: 17, weight: .regular),
+        lineHeight: TiebaPostRowLayout.abstractLineHeight
+      )
+      stack.addArrangedSubview(abstractLabel)
+    }
+
+    if snapshot.imageURL != nil, imageAspect > 0 {
+      imageView.contentMode = .scaleAspectFill
+      // 列表已解好的位图先顶上：占位卡的图按卡片内容宽取（与列表行文本列宽不同 ⇒
+      // Nuke 缓存键不同），先用它兜住，等按本卡尺寸的新图解码完再替换——否则这段
+      // 时间就是一片灰（用户 2026-09-19 报的"缩略图明明加载好了，进帖一片灰"）。
+      imageView.image = snapshot.thumbnailImage
+      // 取图时机交给自己：卡片（card）/栈都是本视图的子孙，在本视图的
+      // layoutSubviews 里读 imageView.bounds 还是 0（约束逐层下推），图片永远
+      // 取不到——用户报的"占位卡里没有图片"。自己布局完再取，尺寸必然成立。
+      imageView.onLayout = { [weak self] in self?.loadImageIfNeeded() }
+      // 圆角在图片管线里烘焙进像素（见 TiebaNuke.displayProcessor）：本层不再
+      // clipsToBounds，省掉每帧一次离屏合成；cornerRadius 只服务占位底色。
+      imageView.layer.cornerRadius = 10
+      imageView.layer.cornerCurve = .continuous
+      imageView.translatesAutoresizingMaskIntoConstraints = false
+      stack.addArrangedSubview(imageView)
+      let ratio = imageView.heightAnchor.constraint(
+        equalTo: imageView.widthAnchor,
+        multiplier: 1 / imageAspect
+      )
+      ratio.priority = .defaultHigh
+      var imageConstraints = [
+        imageView.heightAnchor.constraint(lessThanOrEqualToConstant: TiebaPostRowLayout.singleImageMaxHeight),
+        imageView.heightAnchor.constraint(greaterThanOrEqualToConstant: 1),
+      ]
+      // 竖长图不做比例约束，固定 300（真实卡同规则）；宽度由卡片内容宽决定，
+      // 所以这两个约束在任何宽度下都算得出确定高度。
+      if isTallImage {
+        imageConstraints.append(
+          imageView.heightAnchor.constraint(equalToConstant: TiebaPostRowLayout.longImageHeight)
+        )
+      } else {
+        imageConstraints.append(ratio)
+      }
+      NSLayoutConstraint.activate(imageConstraints)
+    }
+
+    NSLayoutConstraint.activate([
+      // 与真实 Hero 同源：通栏（左右 0），内容边距由 stack 的 16 承担。
+      card.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 0),
+      card.trailingAnchor.constraint(equalTo: trailingAnchor, constant: 0),
+      card.topAnchor.constraint(equalTo: topAnchor),
+      // 底部留白 = 骨架首格的上内白，两块之间的间距才不会突然变。
+      card.bottomAnchor.constraint(equalTo: bottomAnchor, constant: 0),
+      stack.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+      stack.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+      stack.topAnchor.constraint(equalTo: card.topAnchor),
+      stack.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+    ])
+  }
+
+  /// 首图按"视图最终尺寸"取图（下采样 + 烘焙圆角都在管线里）：宽度只有布局后
+  /// 才知道，所以由图片视图**自身**布局结束时触发（见 TiebaKnownPostImageView）。
+  /// 宽度变化（旋屏/分屏）按新尺寸重取。
+  private func loadImageIfNeeded() {
+    guard let url = snapshot.imageURL, imageAspect > 0 else { return }
+    let width = imageView.bounds.width
+    guard width > 1, abs(width - imageViewWidth) > 0.5 else { return }
+    imageViewWidth = width
+    let height = imageHeight(forWidth: width)
+    let scale = max(traitCollection.displayScale, 1)
+    loadImage(
+      with: TiebaNuke.secureURL(url),
+      options: TiebaNuke.options(
+        processor: TiebaNuke.displayProcessor(
+          targetSize: CGSize(width: width, height: height),
+          cornerRadius: imageView.layer.cornerRadius,
+          scale: scale
+        ),
+        transition: true
+      ),
+      into: imageView
+    )
+  }
+}
+
+/// 取图必须在**自身**布局之后：显示档处理器的位图按视图最终尺寸裁切、圆角也烘焙
+/// 在像素里（见 TiebaNuke.displayProcessor），尺寸错了整张图就错。已知主贴卡的
+/// 图片是 card → stack → imageView 的第三层，外层视图的 layoutSubviews 触发时
+/// 它还没拿到 frame，所以由它自己布局结束时回调。
+private final class TiebaKnownPostImageView: UIImageView {
+  var onLayout: (() -> Void)?
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    onLayout?()
+  }
+}

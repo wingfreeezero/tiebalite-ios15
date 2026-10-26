@@ -1,0 +1,173 @@
+// TiebaSettingsSupport —— 设置群共用的原生偏好读写 + 表单/主题辅助
+//
+// ⚠️ 落盘必须与 JS preferencesStore 的 persist 层逐字节兼容：逐键
+// kv["tiebalite_preferences:<key>"] = 该键的 JSON 字面量；坏值回落默认。
+// 读写全走 TiebaPreferenceSnapshot 的类型化 API（不在调用侧手拼字面量）。
+import UIKit
+import os
+
+/// 主题小模型：每个主题一个强调色 + 一个可选底色（其余交给系统语义色）。
+/// 取值与 JS getThemeColors 的 primary/background 一致；未知名回落默认主题。
+enum TiebaThemePalette {
+  static let defaultCustomPrimary = "#4477E0"
+
+  static func accent(themeName: String, customPrimary: String?, isDark: Bool) -> String {
+    switch themeName {
+    case "blue": return isDark ? "#64A5FF" : "#007AFF"
+    case "black": return isDark ? "#E5E5EA" : "#000000"
+    case "pink": return isDark ? "#FFB3B7" : "#FF9A9E"
+    case "red": return isDark ? "#FF6B62" : "#C51100"
+    case "purple": return isDark ? "#B39DDB" : "#512DA8"
+    case "blue_dark": return "#64A5FF"
+    case "grey_dark": return "#9AA3B2"
+    case "amoled_dark": return "#5B9BFF"
+    case "dark": return "#60A5FA"
+    case "tieba":
+      // 品牌蓝 #208AEF（仓内已知值）：此前落 default 分支，与「默认」主题逐值相同，
+      // 选「贴吧蓝」唯一效果是设置行图标变单色。深端按 custom 同一套提亮规则。
+      return isDark ? darkAdapted("#208AEF") : "#208AEF"
+    case "custom":
+      let primary = hex(customPrimary) ?? defaultCustomPrimary
+      return isDark ? darkAdapted(primary) : primary
+    default: return isDark ? "#60A5FA" : "#2563EB"
+    }
+  }
+
+  /// nil = 不该由页面覆盖（默认主题下用系统背景）。
+  static func background(themeName: String, isDark: Bool) -> String? {
+    switch themeName {
+    case "blue_dark": return "#17212B"
+    case "grey_dark": return "#202020"
+    case "amoled_dark", "dark": return "#000000"
+    default: return isDark ? "#000000" : "#F2F2F7"
+    }
+  }
+
+  /// 深浅端主题名（与 ThemeProvider 的 lightThemeName/darkThemeName 同判据）。
+  static func themeName(dark: Bool) -> String {
+    let raw = TiebaPreferences.string(dark ? "darkTheme" : "lightTheme", default: "default")
+    return raw
+  }
+
+  private static func hex(_ raw: String?) -> String? {
+    guard let text = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+      text.count == 7, text.hasPrefix("#"),
+      UInt32(text.dropFirst(), radix: 16) != nil
+    else { return nil }
+    return text.uppercased()
+  }
+
+  /// 深色端把自定义主色提亮（mix 白 45%/25%，同 darkAdapted）。
+  private static func darkAdapted(_ hex: String) -> String {
+    guard let value = UInt32(hex.dropFirst(), radix: 16) else { return hex }
+    let r = Double((value >> 16) & 0xFF) / 255
+    let g = Double((value >> 8) & 0xFF) / 255
+    let b = Double(value & 0xFF) / 255
+    let luminance = 0.299 * r + 0.587 * g + 0.114 * b
+    let amount = luminance < 0.4 ? 0.45 : 0.25
+    func mix(_ channel: Double) -> Int { Int(((channel + (1 - channel) * amount) * 255).rounded()) }
+    return String(format: "#%02X%02X%02X", mix(r), mix(g), mix(b))
+  }
+}
+
+@MainActor
+enum TiebaSettingsForm {
+  /// useFormTintHex() 的原生同义：「默认」主题不染色（行图标五彩），
+  /// 其余主题取当前深浅端的强调色。
+  static func tintHex(dark: Bool) -> String? {
+    let name = TiebaThemePalette.themeName(dark: dark)
+    guard name != "default" else { return nil }
+    let custom = TiebaPreferenceSnapshot.string("customPrimaryColor")
+    return TiebaThemePalette.accent(themeName: name, customPrimary: custom, isDark: dark)
+  }
+
+  static func isDark(systemIsDark: Bool) -> Bool {
+    if TiebaPreferences.bool("followSystemDarkMode", default: true) { return systemIsDark }
+    return TiebaPreferences.bool("darkMode", default: false)
+  }
+
+  static func isDark(in viewController: UIViewController) -> Bool {
+    isDark(systemIsDark: viewController.traitCollection.userInterfaceStyle == .dark)
+  }
+
+  /// 设置行的统一压栈入口（触觉 + 类型化路由）。
+  static func push(_ route: TiebaRoute) {
+    TiebaSceneHaptics.fire("press")
+    _ = TiebaAppHooks.navigate(route)
+  }
+
+  static func makeForm() -> TiebaFormListView {
+    let form = TiebaFormListView(frame: .zero)
+    form.translatesAutoresizingMaskIntoConstraints = false
+    return form
+  }
+
+  static func pin(_ form: TiebaFormListView, in view: UIView) {
+    NSLayoutConstraint.activate([
+      form.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      form.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      form.topAnchor.constraint(equalTo: view.topAnchor),
+      form.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+    ])
+  }
+
+  static func reload(_ form: TiebaFormListView, isDark: Bool) {
+    form.tintHex = tintHex(dark: isDark)
+    form.isDark = isDark
+  }
+
+  /// 主题/工具栏偏好变更后重刷原生壳（导航栏、底栏、状态栏、窗口底色）。
+  /// ⚠️ JS 侧内存副本不随之更新（过渡期，见批次报告）。
+  static func applyTheme(dark: Bool, accentHex: String) {
+    let accent = TiebaFormColor.hex(accentHex) ?? .tintColor
+    let toolbarPrimary = TiebaPreferences.bool("toolbarPrimaryColor", default: false)
+    let statusBarFontDark = TiebaPreferences.bool("statusBarFontDark", default: false)
+    // 工具栏主色调档位下 navTint 依赖深浅 ⇒ 同样是动态色（跟随系统时实时切换）。
+    let navTint: UIColor = toolbarPrimary
+      ? UIColor { $0.userInterfaceStyle == .dark ? .white : (statusBarFontDark ? .black : .white) }
+      : .label
+    // 页面/窗口底色做成**动态色**：浅深两版现在就都算好，之后由 UIKit 按 trait 解析。
+    // 这样"跟随系统"时系统切深浅，所有持有这个颜色的视图（页面底色、宿主/窗口/
+    // 导航容器底色）自动跟着变，不需要谁去逐个重刷——之前是具体色，所以切完只有
+    // 系统语义色（卡片）变了、页面底色留在白色（用户 2026-09-16 报）。
+    // 手动模式也成立：窗口级 override 会把这个 trait 解析成应用主题那一档。
+    // ⚠️ provider 里不能再读偏好（UIColor 的解析发生在渲染/布局期，读 KV 是热路径活）。
+    let lightBackground = TiebaThemePalette
+      .background(themeName: TiebaThemePalette.themeName(dark: false), isDark: false)
+      .flatMap { TiebaFormColor.hex($0) } ?? .white
+    let darkBackground = TiebaThemePalette
+      .background(themeName: TiebaThemePalette.themeName(dark: true), isDark: true)
+      .flatMap { TiebaFormColor.hex($0) } ?? .black
+    let background = UIColor { traits in
+      traits.userInterfaceStyle == .dark ? darkBackground : lightBackground
+    }
+    TiebaAppHooks.applyTheme(
+      TiebaChromeTheme(tint: accent, navTint: navTint, background: background, dark: dark)
+    )
+    let lightStatusBar = toolbarPrimary
+      ? (dark ? true : !statusBarFontDark)
+      : dark
+    TiebaAppHooks.setDefaultStatusBarStyle(lightStatusBar ? .lightContent : .darkContent)
+    TiebaSystemUI.setBackgroundColor(background)
+  }
+
+}
+
+/// 轻量 Toast（原 RN Toast 的 pill 形态；TiebaPhotoBrowserPillView 是既有的原生实现）。
+@MainActor
+enum TiebaToast {
+  static func show(_ text: String, success: Bool = true) {
+    guard let host = TiebaTopViewController.find() else { return }
+    let pill = TiebaPhotoBrowserPillView()
+    pill.translatesAutoresizingMaskIntoConstraints = false
+    host.view.addSubview(pill)
+    NSLayoutConstraint.activate([
+      pill.centerXAnchor.constraint(equalTo: host.view.centerXAnchor),
+      pill.bottomAnchor.constraint(
+        equalTo: host.view.safeAreaLayoutGuide.bottomAnchor,
+        constant: -24
+      ),
+    ])
+    pill.showResult(success: success, text: text)
+  }
+}

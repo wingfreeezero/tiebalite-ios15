@@ -1,0 +1,80 @@
+# Native module: protoc 生成代码（Proto）+ app UI/services（TiebaNative）。
+#
+# 2026-10-07 按真实依赖切分为两个 target（原先 1 个 swift_library / 505 个源文件 / 1 个 SwiftCompile 动作）：
+#   · //Sources/TiebaNative:Proto        267 个 .pb.swift，leaf
+#   · //Sources/TiebaNative:TiebaNative  238 个源文件 + 桶文件 Exports.swift，模块名保持不变
+# 为什么是两个而不是更多：非 Proto 的 235 个文件实测构成**一个强连通分量**
+#   （Core ↔ UI ↔ ListKit ↔ Media ↔ Features ↔ App 双向互相引用；两套独立方法——名字级静态扫描
+#    与 swiftc 逐文件探针——结论一致）。swift_library 的依赖不许成环，因此在「不搬代码、不改封装」
+#    的前提下不可能再往下切；要再拆必须先做依赖倒置/声明搬迁。
+#
+# 注意：Proto 的 target 定义在本文件而不是 Proto/BUILD.bazel——一旦 Proto/ 成为子包，
+#   本包就不能再 exports_files 它下面的 proto-descriptors.json，//TiebaLite:app_resources 会断。
+load("@rules_swift//swift:swift_library.bzl", "swift_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# proto 描述符：随 app bundle 发布，启动时由 TiebaAppBootstrap 读入注册表。
+exports_files(["Proto/proto-descriptors.json"])
+
+# ── 生成代码（leaf module）──────────────────────────────────────────────────
+# 267 个 protoc 产物，只依赖 SwiftProtobuf，不依赖本仓任何代码（swiftc 单独编过：0 error）。
+swift_library(
+    name = "Proto",
+    srcs = glob(["Proto/Generated/**/*.swift"]),
+    features = ["swift.enable_v6"],
+    # 生成代码原先与宿主同模块、声明全是 internal（无访问修饰符）；跨 module 后统一补 public，
+    # 等价于 protoc-gen-swift 的 --swift_opt=Visibility=Public。fileprivate 的内部存储类不动。
+    module_name = "TiebaNativeProto",
+    deps = ["//Vendor/SwiftProtobuf"],
+)
+
+# ── App 代码 ────────────────────────────────────────────────────────────────
+swift_library(
+    name = "TiebaNative",
+    srcs = ["Exports.swift"] + glob(
+        ["**/*.swift"],
+        exclude = [
+            "Exports.swift",
+            "Proto/**/*.swift",
+        ],
+    ),
+    features = ["swift.enable_v6"],
+    # -lsqlite3 mirrors the podspec's `s.libraries = 'sqlite3'` (TiebaSQLite.swift).
+    # 只有本 module 用 SQLite（Core/TiebaSQLite.swift）；Proto 是纯 protobuf，不需要。
+    linkopts = ["-lsqlite3"],
+    module_name = "TiebaNative",
+    deps = [
+        ":Proto",
+        # GIF 播放已改为原生 ImageIO（UI/Media/TiebaGIFPlayer.swift），Gifu 依赖已删除（2026-10-05）。
+        "//Vendor/Hero",
+        "//Vendor/JXPhotoBrowser",
+        "//Vendor/Nuke",
+        "//Vendor/Nuke:NukeExtensions",
+        "//Vendor/SwiftProtobuf",
+        # 上游 移植的 Vendor 依赖已**全部移除**（2026-10-05）。
+        # 依据：docs/uikit-migration/{17,18,19,20} 四份独立审计 + 逐对比。
+        #   ① 该接线 1.6%（且已接线）；② 重复 61.7%；③ 无用 36.7%。
+        #   ② 里"现有实现更好"是多数（ComponentFlow 拿不到液态玻璃、TextNode 的几何是手绘文本才需要、
+        #      ContainedViewLayoutTransition 对应的布局动画本仓从设计上就不做、HapticFeedback 弱于 TiebaHaptics…）；
+        #   强行替换会破坏 6 项现有能力（后台整页测量 / 系统选择 UI 与无障碍 / 位图管线 /
+        #   iOS 26 液态玻璃 / 逐像素几何 / 命中区语义）。
+        # 仍在用的三件已**移入第一方**并解散 早期 vendor 目录 目录，现直接放在 Core/：
+        #   TiebaMergeLists / TiebaMergeIdentifiable / TiebaPersistentStringHash。
+        # 被借鉴的少数做法已用本仓风格重写：Core/TiebaURLQueryValue、Core/TiebaAnimationFrameRate、
+        #   Core/TiebaColorContrast（见各自文件头的"借鉴自"注明）。
+        # 原 早期 vendored 的模块 三个模块已整目录删除，备份在 /tmp/removed_ports/（可从上游重新移植）。
+        #
+        # 2026-10-06 起改为「按 .swift 原生落地」：上游可移植件不再进 Vendor/，而是直接落到本模块的
+        # 原生目录里（与第一方代码同一 swift_library、同一 Swift 6 严格并发标准）：
+        #   Core/Tables/     A2 数据表（MIME / CLDR 复数 / NOAA 日出 / 转写 / 联系人 / 距离传感器）
+        #   Core/Binary/     A2 二进制（单调时钟 / MurmurHash / CRC32 / 摘要与 AES / PKCS#7 / GZip / YUV / 环形缓冲 …）
+        #   UI/Text/         文本坐标系（TiebaTextNodeLayout + 渲染器 + TiebaTextView + 链接高亮）
+        #   UI/Transition/   容器布局与转场（ContainedViewLayoutTransition + ControlledTransition + 9 种插值）
+        #   UI/Nodes/        tooltip / confetti / 指示器 / 数字滚动 / 导航条纹 / 在线点
+        #   UI/Drawing/      参数→位图绘制、三态按钮、波形、透明判定、几何与小手势件
+        #   UI/Context/      按压激活手势 / 绕内容中点缩放 / 玻璃气泡 / 菜单模型
+        # srcs 是 glob(["**/*.swift"])，新增目录无需改本文件。
+        # 落地记录：docs/uikit-migration/21-落地-*.md。
+    ],
+)
